@@ -1,5 +1,8 @@
 import { resolve } from 'path';
 import { normalizeS3KeyPrefix } from '../common/storage/s3-key-prefix';
+import { namesBundledContainer } from '../modules/docker/bundled-host';
+import { resolveBodyLimit } from './bootstrap-security';
+import { parseBodyLimitBytes } from './inflight-body-budget';
 
 type EnvConfig = Record<string, unknown>;
 
@@ -57,6 +60,65 @@ export function postgresSchemaError(schema: string): string | null {
   return null;
 }
 
+const REDIS_CONSUMER_FLAGS = ['REDIS_ENABLED', 'QUEUE_ENABLED', 'CACHE_ENABLED'];
+
+/** The one way to keep TLS or a named user: an external server, which the Infrastructure page selects too. */
+const EXTERNAL_REDIS_WAY_OUT =
+  'or use an external Redis (REDIS_BUILTIN=false with its REDIS_HOST, also on the Infrastructure page)';
+
+/** The bundled Redis is the one this deployment connects to: it is selected, in use, and named as the host. */
+function usesBundledRedis(config: EnvConfig): boolean {
+  const host = typeof config.REDIS_HOST === 'string' ? config.REDIS_HOST : undefined;
+  return (
+    REDIS_CONSUMER_FLAGS.some(key => config[key] === 'true') &&
+    config.REDIS_BUILTIN === 'true' &&
+    namesBundledContainer('redis', host)
+  );
+}
+
+/** The bundled Redis listens in plaintext; a TLS handshake against it fails on every connect. */
+export function builtinRedisTlsError(config: EnvConfig): string | null {
+  if (!usesBundledRedis(config) || config.REDIS_TLS !== 'true') return null;
+  return (
+    'REDIS_TLS=true cannot reach the built-in Redis container, which runs without TLS; set REDIS_TLS=false in the ' +
+    `environment, ./.env or data/.env.generated, ${EXTERNAL_REDIS_WAY_OUT}`
+  );
+}
+
+/** The bundled Redis has only its default user; ioredis authenticates as any other name and is refused. */
+export function builtinRedisUsernameError(config: EnvConfig): string | null {
+  const username = typeof config.REDIS_USERNAME === 'string' ? config.REDIS_USERNAME : undefined;
+  if (!usesBundledRedis(config) || !username || username === 'default') return null;
+  return (
+    'REDIS_USERNAME must be unset or default for the built-in Redis container; remove the named username in the ' +
+    `environment, ./.env or data/.env.generated, ${EXTERNAL_REDIS_WAY_OUT}`
+  );
+}
+
+/**
+ * The S3 client builds every request from S3_ENDPOINT. A value without a scheme (`minio:9000`) does not stop the
+ * client from being built: each call then fails as "Invalid URL" and media goes to the local fallback directory.
+ * That deployment runs today, so validateEnv leaves it alone and the boot reports this message at ERROR level; the
+ * Infrastructure save refuses it, so the page never stores one. Only checked while S3 is the selected storage, and
+ * the value is not echoed, as it may hold keys.
+ */
+export function s3EndpointError(config: EnvConfig): string | null {
+  const raw = config.S3_ENDPOINT;
+  const endpoint = typeof raw === 'string' ? raw.trim() : '';
+  if (!endpoint || config.STORAGE_TYPE !== 's3') return null;
+  let protocol: string | undefined;
+  try {
+    protocol = new URL(endpoint).protocol;
+  } catch {
+    protocol = undefined;
+  }
+  if (protocol === 'http:' || protocol === 'https:') return null;
+  return (
+    'S3_ENDPOINT must be an absolute http(s) URL such as "http://minio:9000"; set it in the environment, ./.env or ' +
+    'data/.env.generated, or on the Infrastructure page'
+  );
+}
+
 /**
  * Fail-fast environment validation. Wired as ConfigModule's `validate`
  * callback so a misconfigured deployment is rejected at BOOT instead of silently
@@ -98,6 +160,13 @@ export function validateEnv(config: EnvConfig): EnvConfig {
   };
   checkEnum('ENGINE_TYPE', ['whatsapp-web.js', 'baileys']);
   checkEnum('STORAGE_TYPE', ['local', 's3']);
+  checkEnum('MESSAGE_INLINE_MEDIA', ['inline', 'archive']);
+  // 'archive' drops the inline copy only after the archiver stored the file; with the archiver off
+  // nothing is ever stored, so the mode would silently do nothing. Refuse that rather than let an
+  // operator believe the inline copies are being reclaimed.
+  if (rawEnum('MESSAGE_INLINE_MEDIA') === 'archive' && config.CHAT_MEDIA_ARCHIVE_ENABLED !== 'true') {
+    errors.push('MESSAGE_INLINE_MEDIA=archive needs CHAT_MEDIA_ARCHIVE_ENABLED=true');
+  }
   // The S3 key root. A prefix that is absolute, traverses, or is only slashes would put this
   // deployment's objects (and its orphan sweeps' deletes) at the bucket root or outside its own root;
   // one with an empty or '.' segment builds keys an S3-compatible store refuses on every write.
@@ -105,6 +174,14 @@ export function validateEnv(config: EnvConfig): EnvConfig {
   if (s3KeyPrefix !== undefined && normalizeS3KeyPrefix(s3KeyPrefix) === null) {
     errors.push(
       `S3_KEY_PREFIX must be a relative key prefix such as "staging/" with no empty, "." or ".." segment (got ${JSON.stringify(s3KeyPrefix)})`,
+    );
+  }
+  // The BullMQ key prefix is joined to the queue name with a colon in every Redis key, so a colon or
+  // whitespace in it builds keys that tooling cannot split back apart.
+  const queuePrefix = str('QUEUE_PREFIX');
+  if (queuePrefix !== undefined && !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(queuePrefix)) {
+    errors.push(
+      `QUEUE_PREFIX must be 1 to 64 letters, digits, dots, underscores or hyphens, starting with a letter or digit (got ${JSON.stringify(queuePrefix)})`,
     );
   }
   // Every production hardening in the repo gates on the exact string 'production', so an
@@ -148,14 +225,28 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     // POSTGRES_SCHEMA is optional (defaults to 'public' in configuration.ts). When set, validate it
     // is a legal, non-reserved Postgres identifier so a typo / injection-ish value fails fast at boot
     // rather than reaching CREATE TABLE "<schema>"."..." (or a search_path SET) at migration time.
-    // Lower case only: the search_path startup option is unquoted, so Postgres folds it to lower
-    // case, while TypeORM quotes the schema. A mixed-case name would split DDL and queries across
-    // two schemas. The raw value is checked, untrimmed: the app and the migration CLI both use it
-    // as set, so a padded (or whitespace-only) value must fail here as it fails in the CLI.
+    // Lower case only: the search_path the app sets with set_config on connect is unquoted, so Postgres
+    // folds it to lower case, while TypeORM quotes the schema. A mixed-case name would split DDL and
+    // queries across two schemas. The raw value is checked, untrimmed: the app and the migration CLI both
+    // use it as set, so a padded (or whitespace-only) value must fail here as it fails in the CLI.
     const pgSchema = config.POSTGRES_SCHEMA;
     const pgSchemaError = typeof pgSchema === 'string' && pgSchema !== '' ? postgresSchemaError(pgSchema) : null;
     if (pgSchemaError) {
       errors.push(pgSchemaError);
+    }
+    // The bundled PostgreSQL container runs without TLS (DockerService.getContainerSpec sets none up), so the built-in
+    // database with DATABASE_SSL=true retries its connection until the boot gives up, and the dashboard that could undo
+    // it stays down. Both flags are read raw, as configuration.ts and the boot guard compare them.
+    const dbHost = str('DATABASE_HOST');
+    if (
+      config.POSTGRES_BUILTIN === 'true' &&
+      config.DATABASE_SSL === 'true' &&
+      namesBundledContainer('postgres', dbHost)
+    ) {
+      errors.push(
+        `DATABASE_SSL=true cannot reach the built-in PostgreSQL container (POSTGRES_BUILTIN=true, DATABASE_HOST=${dbHost}), ` +
+          'which runs without TLS: set DATABASE_SSL=false where it is set (data/.env.generated, the project .env or the environment)',
+      );
     }
   } else {
     // SQLite (explicit or default): DATABASE_NAME is a file path for the 'data' connection. It must
@@ -182,21 +273,32 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     }
   }
 
+  const redisTlsError = builtinRedisTlsError(config);
+  if (redisTlsError) errors.push(redisTlsError);
+  const redisUsernameError = builtinRedisUsernameError(config);
+  if (redisUsernameError) errors.push(redisUsernameError);
+
   // Plain decimal digits only: these numeric knobs are read downstream with parseInt(raw, 10),
   // which silently truncates spellings Number() would accept (`1e6` → 1, `0x100` → 0) — the boot
   // would validate one value and then configure another. Requiring digits keeps the validated
   // value identical to the parsed one.
   const DECIMAL_INTEGER = /^\d+$/;
 
-  const checkPort = (key: string): void => {
-    const raw = str(key);
+  const checkPort = (key: string, read: (key: string) => string | undefined = str): void => {
+    const raw = read(key);
     if (raw === undefined) return;
     const n = DECIMAL_INTEGER.test(raw) ? Number(raw) : NaN;
     if (!Number.isInteger(n) || n < 1 || n > 65535) {
       errors.push(`${key} must be an integer port in [1, 65535] (got "${raw}")`);
     }
   };
-  checkPort('PORT');
+  // PORT is read untrimmed: main.ts listens on it, and the image healthcheck and the startup banner
+  // splice it into a URL, where a padded "2785 " is malformed although Node still binds 2785. Only an
+  // empty value takes the default there, so validate the exact value with only '' meaning unset.
+  checkPort('PORT', key => {
+    const value = config[key];
+    return typeof value === 'string' && value !== '' ? value : undefined;
+  });
   checkPort('DATABASE_PORT');
   checkPort('REDIS_PORT');
 
@@ -223,6 +325,7 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     'WEBHOOK_MAX_PER_SESSION', // 0 = unlimited
     'AUTOMATION_MAX_PER_SESSION', // 0 = unlimited
     'WEBHOOK_MEDIA_INLINE_MAX_BYTES', // 0 = never inline media
+    'WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS', // 0 = failure rows keep no payload (no redrive)
     'EXPORT_INLINE_MEDIA_BUDGET_BYTES', // 0 = a data export carries no inline media at all
     'MESSAGE_LIST_INLINE_MEDIA_BUDGET_BYTES', // 0 = a message list carries no inline media at all
     'CHAT_MEDIA_ARCHIVE_TTL_DAYS', // 0 = keep archived chat media forever
@@ -230,6 +333,16 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     'REDIS_CACHE_DB',
     'INBOUND_MEDIA_GLOBAL_CONCURRENCY', // 0 = no process-wide ceiling, only the per-session one
     'SHUTDOWN_DELAY_MS', // 0 = no drain; parseInt read `3s` as a 3 ms drain
+    'WEBHOOK_SHUTDOWN_DRAIN_MS', // 0 = no wait; a malformed value fell back to 5000 and also moved the force-exit
+    // 0 = disabled. A negative value failed the digits-only read and silently kept the default sweep.
+    'MESSAGE_REAPER_INTERVAL_MS',
+    'WEBHOOK_RECONCILE_INTERVAL_MS',
+    'INGRESS_RECONCILE_INTERVAL_MS',
+    // 0 = act on a row as soon as it is seen; the cap below keeps the cutoff inside the safe range.
+    'MESSAGE_REAPER_GRACE_MS',
+    'WEBHOOK_RECONCILE_GRACE_MS',
+    'INGRESS_RECONCILE_GRACE_MS',
+    'BAILEYS_GROUP_METADATA_CACHE_TTL_MS', // 0 = no cache; every group send then queries the participant list
   ]) {
     checkNonNegativeInt(key);
   }
@@ -279,6 +392,20 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     const days = str(key);
     if (days !== undefined && Number(days) > 36500) {
       errors.push(`${key} must be at most 36500 (got "${days}")`);
+    }
+  }
+  // The same cutoff bound, expressed in hours.
+  {
+    const hours = str('WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS');
+    if (hours !== undefined && Number(hours) > 36500 * 24) {
+      errors.push(`WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS must be at most ${36500 * 24} (got "${hours}")`);
+    }
+  }
+  // The grace windows build the same kind of cutoff (now minus the grace), so they share the cap.
+  for (const key of ['MESSAGE_REAPER_GRACE_MS', 'WEBHOOK_RECONCILE_GRACE_MS', 'INGRESS_RECONCILE_GRACE_MS']) {
+    const raw = str(key);
+    if (raw !== undefined && DECIMAL_INTEGER.test(raw) && Number(raw) > 36500 * 86_400_000) {
+      errors.push(`${key} must be at most ${36500 * 86_400_000} ms, 36500 days (got "${raw}")`);
     }
   }
 
@@ -355,6 +482,8 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     // Positive-only is the POINT here, not a convention: 0 arms no Puppeteer timer at all, so a
     // wedged renderer holds the request forever (see wwebjs-lifecycle.ts).
     'PUPPETEER_PROTOCOL_TIMEOUT_MS',
+    // The read fell back to its default on garbage, so `10s` silently meant 10000.
+    'SSRF_DNS_TIMEOUT_MS',
     // The media knobs take RAW numbers while their neighbours in .env.example and docs/12 take unit
     // strings (`BODY_SIZE_LIMIT=25mb`), and their read sites parse with `Number.parseInt`. That
     // accepts the leading digits of a unit-suffixed value and discards the unit, so
@@ -386,7 +515,7 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     'TEMPLATE_RENDER_MAX_CHARS',
     'STORAGE_IMPORT_MAX_BYTES',
     'STORAGE_IMPORT_MAX_ENTRIES',
-    'STORAGE_LIST_MAX_FILES',
+    'STORAGE_IMPORT_MAX_TOTAL_BYTES',
     'BAILEYS_MESSAGE_STORE_LIMIT',
     // Each read fell back to its default on 0 or garbage, or passed a negative or fractional value on
     // (SEARCH_LIMIT_MAX reached plugin search providers as-is).
@@ -396,6 +525,16 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     'INGRESS_WORKER_CONCURRENCY',
   ]) {
     checkPositiveInt(key);
+  }
+
+  // The body cap takes a unit string. A spelling the parser does not know (`50M`, `50MiB`) silently
+  // becomes the 25mb default, and a value that parses to 0 bytes refuses every request carrying a
+  // body, the same self-DoS INFLIGHT_BODY_BUDGET_BYTES is refused for above.
+  const bodyLimit = str('BODY_SIZE_LIMIT');
+  if (bodyLimit !== undefined && (resolveBodyLimit(bodyLimit) !== bodyLimit || parseBodyLimitBytes(bodyLimit) < 1)) {
+    errors.push(
+      `BODY_SIZE_LIMIT must be a positive size such as 25mb or 1048576 (units b, kb, mb, gb, tb, pb; got "${bodyLimit}")`,
+    );
   }
 
   // The ceiling matters for the same reason from the other side: the docs forbid 0, so an operator
@@ -418,10 +557,14 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     ['RATE_LIMIT_MEDIUM_TTL', 'each hit expires after 1 ms and that rate-limit tier never blocks'],
     ['RATE_LIMIT_LONG_TTL', 'each hit expires after 1 ms and that rate-limit tier never blocks'],
     ['INGRESS_INSTANCE_TTL', 'each hit expires after 1 ms and the ingress rate limits never block'],
+    ['SSRF_DNS_TIMEOUT_MS', 'every guarded DNS lookup times out, failing webhook deliveries and URL downloads'],
     // 0 still disables these three, so they carry only the ceiling, not the positive-only check.
     ['MESSAGE_REAPER_INTERVAL_MS', 'the pending message reaper reruns every millisecond'],
     ['WEBHOOK_RECONCILE_INTERVAL_MS', 'the webhook reconciler reruns every millisecond'],
     ['INGRESS_RECONCILE_INTERVAL_MS', 'the ingress reconciler reruns every millisecond'],
+    // 0 disables these two as well; pg arms both with a plain setTimeout.
+    ['DATABASE_CONNECTION_TIMEOUT_MS', 'every pool connect times out'],
+    ['DATABASE_IDLE_TIMEOUT_MS', 'each idle pool connection is closed 1 ms after release'],
   ]) {
     const raw = str(key);
     const n = raw !== undefined && DECIMAL_INTEGER.test(raw) ? Number(raw) : NaN;
@@ -431,6 +574,19 @@ export function validateEnv(config: EnvConfig): EnvConfig {
           `timers overflow above that and fire after 1 ms, so ${consequence}`,
       );
     }
+  }
+  // Not a Node timer, but the same ceiling: PostgreSQL's statement_timeout is an int capped at
+  // 2147483647, and a larger startup value is refused on every runtime connection. 0 still disables.
+  const statementTimeout = str('DATABASE_STATEMENT_TIMEOUT_MS');
+  if (
+    statementTimeout !== undefined &&
+    DECIMAL_INTEGER.test(statementTimeout) &&
+    Number(statementTimeout) > MAX_TIMER_MS
+  ) {
+    errors.push(
+      `DATABASE_STATEMENT_TIMEOUT_MS must not exceed ${MAX_TIMER_MS} ms (got "${statementTimeout}"): ` +
+        'PostgreSQL refuses a larger statement_timeout, so every runtime connection fails',
+    );
   }
   // Knobs armed at a multiple of their value get that fraction of the timer's ceiling. Send verbs arm
   // four times PLUGIN_CAP_TIMEOUT_MS (SEND_CAP_TIMEOUT_FACTOR in plugin-worker-host.ts); a direct
@@ -520,6 +676,7 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     'RESOLVE_LID_TO_PHONE',
     'SIMULATE_TYPING',
     'SEARCH_ENABLED',
+    'SEARCH_CONTAINS_ENABLED',
     // Read at boot by the throttler factory (app.module.ts) and CacheService with `=== 'true'`: a
     // typo like `ture` silently downgrades rate-limit storage + cache to per-process in-memory.
     'REDIS_ENABLED',
@@ -548,6 +705,8 @@ export function validateEnv(config: EnvConfig): EnvConfig {
     // `=== 'true'`: a typo keeps the main connection on its migrations, so an operator who meant to
     // opt into synchronize for api_keys/audit_logs silently does not get it.
     'MAIN_DATABASE_SYNCHRONIZE',
+    // Same for the data connection: on SQLite a typo silently runs the migration chain instead.
+    'DATABASE_SYNCHRONIZE',
     // Read with `=== 'true'` by the plugin ingress gate: a typo turns an intentional
     // `ALLOW_UNSIGNED_INGRESS=true` back off, and a route the operator meant to open stops loading.
     'ALLOW_UNSIGNED_INGRESS',

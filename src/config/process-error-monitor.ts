@@ -36,6 +36,18 @@ interface RejectionLogger extends FatalLogger {
 const PAGE_CONTEXT_LOST_REJECTION = /execution context was destroyed|window\.require is not a function/i;
 
 /**
+ * String() throws on a null-prototype object or one whose toString/valueOf throws. Inside a process
+ * listener that throw becomes a fresh uncaught exception, so fall back to the `[object Tag]` form.
+ */
+function safeString(value: unknown): string {
+  try {
+    return String(value);
+  } catch {
+    return Object.prototype.toString.call(value);
+  }
+}
+
+/**
  * Register an `uncaughtExceptionMonitor` that routes an otherwise-fatal uncaught exception through the
  * structured logger BEFORE Node's default handling.
  *
@@ -71,8 +83,12 @@ export function registerUncaughtExceptionMonitor(logger: FatalLogger): void {
  * One class is logged at WARN instead of ERROR: a Puppeteer rejection left behind when the page an
  * `evaluate` was waiting on goes away. whatsapp-web.js re-runs `inject()` from an async
  * `framenavigated` listener it never awaits, so a page navigation or an engine teardown turns that
- * still-pending evaluate into a rejection with no owner (#982). Either way the session recovers on its
- * own, and an ERROR with a raw Puppeteer stack reads like a crash.
+ * still-pending evaluate into a rejection with no owner (#982). Once a launch has finished, the
+ * whatsapp-web.js adapter catches those re-injects itself (it logs a failed one as `page_reinject_failed`,
+ * and one that dies under its own teardown not at all), so what still reaches this handler is the
+ * re-inject of a client whose launch a teardown cut short, and any other Puppeteer call a navigation or
+ * a teardown leaves without an owner. Either way the session recovers on its own, and an ERROR with a
+ * raw Puppeteer stack reads like a crash.
  *
  * Deliberately scoped so nothing actionable is muted: the ACTIONABLE variant of the same message — a
  * browser profile left stale by an upgrade that changed the Chromium binary (#663/#708) — is thrown
@@ -81,8 +97,8 @@ export function registerUncaughtExceptionMonitor(logger: FatalLogger): void {
  */
 export function registerUnhandledRejectionHandler(logger: RejectionLogger): void {
   process.on('unhandledRejection', (reason: unknown) => {
-    const message = reason instanceof Error ? reason.message : String(reason);
-    const detail = reason instanceof Error ? reason.stack : String(reason);
+    const message = reason instanceof Error ? reason.message : safeString(reason);
+    const detail = reason instanceof Error ? reason.stack : safeString(reason);
     const pageContextLost = PAGE_CONTEXT_LOST_REJECTION.test(message);
     incrementUnhandledRejections(pageContextLost ? 'page_context_lost' : 'other');
     if (pageContextLost) {
@@ -98,4 +114,24 @@ export function registerUnhandledRejectionHandler(logger: RejectionLogger): void
     }
     logger.error('Unhandled promise rejection', detail);
   });
+}
+
+/** The codes a write fails with once the far end of stdout or stderr is gone: a closed terminal, a closed pipe. */
+const LOST_OUTPUT_CODES = new Set(['EIO', 'EPIPE']);
+
+/**
+ * Keep a lost stdout or stderr from ending the process. After a terminal closes (the SIGHUP that starts a
+ * stop) or the pipe behind a log stream breaks, the next write fails with EIO or EPIPE and the stream emits
+ * 'error'. With no listener that is an uncaught exception, which ends the process at the first log line
+ * after the signal, before the teardown the signal started has run. Nothing can read those lines any
+ * more, so the error is dropped. Any other stream error is thrown again, as it is without a listener.
+ */
+export function ignoreLostOutput(
+  streams: Array<Pick<NodeJS.EventEmitter, 'on'>> = [process.stdout, process.stderr],
+): void {
+  for (const stream of streams) {
+    stream.on('error', (err: NodeJS.ErrnoException) => {
+      if (!err.code || !LOST_OUTPUT_CODES.has(err.code)) throw err;
+    });
+  }
 }

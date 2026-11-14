@@ -26,6 +26,7 @@ describe('WwebjsChats.setOnlinePresence', () => {
     const host = {
       ensureReady: jest.fn(),
       getClient: () => client as unknown as Client,
+      isPageTransportError: () => false,
       logger,
     } as unknown as WwebjsEngineHost;
     return { chats: new WwebjsChats(host, {} as unknown as WwebjsMessaging), client };
@@ -82,12 +83,14 @@ describe('BaileysMessaging.setOnlinePresence', () => {
   } {
     const sock = {
       sendPresenceUpdate: jest.fn().mockResolvedValue(undefined),
-      // null means creds.me itself is missing; '' is the empty name Baileys also ignores.
-      ...(name === null ? {} : { user: { name } }),
+      // The live credentials Baileys reads. null means creds.me itself is missing; '' is the empty name
+      // Baileys also ignores.
+      authState: { creds: name === null ? {} : { me: { id: '628999:12@s.whatsapp.net', name } } },
     };
     const host = {
       ensureReady: jest.fn(),
       getSocket: () => sock as unknown as WASocket,
+      getSocketOrNull: () => sock as unknown as WASocket,
       toEngineJid: (jid: string) => jid,
       recordLidMapping: jest.fn(),
       logger,
@@ -115,6 +118,21 @@ describe('BaileysMessaging.setOnlinePresence', () => {
 
   it('refuses when the push name is not set — Baileys would resolve without sending', async () => {
     const { messaging, sock } = makeMessaging(null);
+    await expect(messaging.setOnlinePresence(true)).rejects.toBeInstanceOf(EngineNotReadyError);
+    expect(sock.sendPresenceUpdate).not.toHaveBeenCalled();
+  });
+
+  it('publishes once the name has synced, though the socket was built before the account had one', async () => {
+    const { messaging, sock } = makeMessaging('Synced Name');
+    // sock.user is the copy of creds.me taken when the socket was built, right after the link.
+    sock.user = {};
+    await messaging.setOnlinePresence(false);
+    expect(sock.sendPresenceUpdate).toHaveBeenCalledWith('unavailable');
+  });
+
+  it('refuses while the live credentials have no name, whatever the build-time copy holds', async () => {
+    const { messaging, sock } = makeMessaging(null);
+    sock.user = { name: 'Stale' };
     await expect(messaging.setOnlinePresence(true)).rejects.toBeInstanceOf(EngineNotReadyError);
     expect(sock.sendPresenceUpdate).not.toHaveBeenCalled();
   });

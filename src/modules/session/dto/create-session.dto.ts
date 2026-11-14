@@ -1,7 +1,14 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { Transform } from 'class-transformer';
 import { IsIn, IsObject, IsOptional, IsString, IsUrl, Matches, MaxLength, MinLength, Validate } from 'class-validator';
+import { ToStrictString } from '../../../common/utils/strict-boolean';
 import { MaxCodePoints } from '../../../common/validation/max-code-points';
 import { HasDecodableProxyCredentialsConstraint } from './has-decodable-proxy-credentials.validator';
+import {
+  MAX_SESSION_CONFIG_BYTES,
+  normaliseSessionConfig,
+  RecognisedSessionConfigConstraint,
+} from './recognised-session-config.validator';
 
 export class CreateSessionDto {
   @ApiProperty({
@@ -10,6 +17,7 @@ export class CreateSessionDto {
     minLength: 3,
     maxLength: 50,
   })
+  @ToStrictString()
   @IsString()
   @MinLength(3)
   @MaxLength(50)
@@ -27,13 +35,17 @@ export class CreateSessionDto {
       'reconnectBaseDelay (1000-300000 ms, default 5000) sets the backoff base, both for the ' +
       "gateway's own reconnect only (on Baileys the engine retries a transient drop itself, with a " +
       'fixed backoff and no cap). Anything else is ' +
-      'stored but ignored. All three can be changed later with PATCH /api/sessions/{sessionId}/config ' +
+      'stored but ignored, up to ' +
+      `${MAX_SESSION_CONFIG_BYTES} bytes for the whole object serialised as JSON (a larger one is refused with 400). ` +
+      'All three can be changed later with PATCH /api/sessions/{sessionId}/config ' +
       'without a restart: autoRejectCalls applies from the next incoming call, the two reconnect settings ' +
       'from the next session start.',
     example: { autoRejectCalls: false, maxReconnectAttempts: 5, reconnectBaseDelay: 5000 },
   })
+  @Transform(({ value }) => normaliseSessionConfig(value))
   @IsOptional()
   @IsObject()
+  @Validate(RecognisedSessionConfigConstraint)
   config?: Record<string, unknown>;
 
   // Phase 3: Proxy per session
@@ -41,11 +53,14 @@ export class CreateSessionDto {
     description:
       'Optional per-session egress proxy URL (http/https/socks4/socks5; credentialed form ' +
       '"http://user:pass@host" allowed). Must be a REAL, REACHABLE proxy — an unreachable value ' +
-      'silently blocks the WhatsApp WebSocket (no QR is ever delivered) and the session start times ' +
-      'out (~30s → 504 Gateway Timeout). Leave unset unless your network cannot reach WhatsApp directly. ' +
+      'silently blocks the WhatsApp WebSocket (no QR is ever delivered). On whatsapp-web.js the session ' +
+      'start then times out (~30s → 504 Gateway Timeout); on Baileys the start succeeds and the session ' +
+      'keeps retrying the connection. Leave unset unless your network cannot reach WhatsApp directly. ' +
       'Setting it requires an ADMIN key (403 otherwise).',
+    maxLength: 255,
   })
   @IsOptional()
+  @ToStrictString()
   @IsString()
   @MaxCodePoints(255)
   // Reject a malformed/non-proxy URL at the boundary (credentialed http://user:pass@host and

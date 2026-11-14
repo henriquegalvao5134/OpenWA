@@ -11,6 +11,7 @@ describe('ContactController', () => {
     getNumberId: jest.fn(),
     getProfilePicture: jest.fn(),
     resolveContactPhone: jest.fn(),
+    getContactLid: jest.fn(),
     upsertContact: jest.fn(),
     deleteContact: jest.fn(),
     blockContact: jest.fn(),
@@ -26,7 +27,7 @@ describe('ContactController', () => {
   it('findAll applies limit/offset query strings', async () => {
     service.listContacts.mockResolvedValue(contacts(50));
     const page = (await controller.findAll('s1', '5', '10')) as { id: string }[];
-    expect(service.listContacts).toHaveBeenCalledWith('s1');
+    expect(service.listContacts).toHaveBeenCalledWith('s1', 10);
     expect(page.map(c => c.id)).toEqual(['10@c.us', '11@c.us', '12@c.us', '13@c.us', '14@c.us']);
   });
 
@@ -52,14 +53,14 @@ describe('ContactController', () => {
   });
 
   it('getProfilePictures splits, trims and drops empty ids', async () => {
-    service.getProfilePictures.mockResolvedValue([null, 'https://pps/2.jpg']);
+    service.getProfilePictures.mockResolvedValue({ 'a@c.us': null, 'b@c.us': 'https://pps/2.jpg' });
     const out = await controller.getProfilePictures('s1', ' a@c.us , ,b@c.us ');
     expect(service.getProfilePictures).toHaveBeenCalledWith('s1', ['a@c.us', 'b@c.us']);
-    expect(out).toEqual({ pictures: [null, 'https://pps/2.jpg'] });
+    expect(out).toEqual({ pictures: { 'a@c.us': null, 'b@c.us': 'https://pps/2.jpg' } });
   });
 
   it('getProfilePictures defaults a missing ids param to an empty list', async () => {
-    service.getProfilePictures.mockResolvedValue([]);
+    service.getProfilePictures.mockResolvedValue({});
     await controller.getProfilePictures('s1');
     expect(service.getProfilePictures).toHaveBeenCalledWith('s1', []);
   });
@@ -101,6 +102,23 @@ describe('ContactController', () => {
     });
   });
 
+  it('getContactLid wraps the number and its lid', async () => {
+    service.getContactLid.mockResolvedValue('234767895240796@lid');
+    await expect(controller.getContactLid('s1', '60123456789')).resolves.toEqual({
+      number: '60123456789',
+      lid: '234767895240796@lid',
+    });
+    expect(service.getContactLid).toHaveBeenCalledWith('s1', '60123456789');
+  });
+
+  it('getContactLid answers lid:null for a number WhatsApp holds no lid for', async () => {
+    service.getContactLid.mockResolvedValue(null);
+    await expect(controller.getContactLid('s1', '60123456789')).resolves.toEqual({
+      number: '60123456789',
+      lid: null,
+    });
+  });
+
   it('getBlockedContacts returns the service list as a bare array', async () => {
     service.getBlockedContacts.mockResolvedValue(['628111@c.us', '628222@c.us']);
     await expect(controller.getBlockedContacts('s1')).resolves.toEqual(['628111@c.us', '628222@c.us']);
@@ -124,5 +142,32 @@ describe('ContactController', () => {
     service[method].mockResolvedValue(undefined);
     await expect(controller[method]('s1', 'c1')).resolves.toEqual(body);
     expect(service[method]).toHaveBeenCalledWith('s1', 'c1');
+  });
+});
+
+// Every route resolves the session's engine first, which answers 400 "Session is not started" for a
+// session with no running engine; clients generated from the OpenAPI contract need it declared.
+describe('ContactController OpenAPI error responses', () => {
+  const handler = (name: string) => Object.getOwnPropertyDescriptor(ContactController.prototype, name)?.value as object;
+  const routes = Object.getOwnPropertyNames(ContactController.prototype).filter(
+    name => name !== 'constructor' && Reflect.getMetadata('path', handler(name)) !== undefined,
+  );
+
+  it('covers every route', () => {
+    expect(routes).toHaveLength(12);
+  });
+
+  it.each(routes)('%s declares 400', method => {
+    const responses = Reflect.getMetadata('swagger/apiResponse', handler(method)) as Record<string, unknown>;
+    expect(Object.keys(responses)).toContain('400');
+  });
+
+  // A started session that is not ready answers 409, so the 400 must not describe it as "not ready".
+  it.each(routes)('%s describes its 400 as a session that is not started', method => {
+    const responses = Reflect.getMetadata('swagger/apiResponse', handler(method)) as Record<
+      string,
+      { description?: string }
+    >;
+    expect(responses['400']?.description).toMatch(/^Session is not started/);
   });
 });

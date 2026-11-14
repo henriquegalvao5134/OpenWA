@@ -1,4 +1,12 @@
-import type { MigrationTables, SessionRow, WebhookRow, MessageRow, MessageBatchRow } from './migration-tables.types';
+import type {
+  MigrationTables,
+  SessionRow,
+  WebhookRow,
+  MessageRow,
+  MessageBatchRow,
+  WebhookDeliveryFailureRow,
+} from './migration-tables.types';
+import { renderTemplate, templateVariableNames } from '../../common/utils/template-render';
 
 /**
  * A `data` value that is a POINTER rather than bytes. `metadata.media.data` holds `base64 || dto.url!`
@@ -23,6 +31,17 @@ function redactWebhookCredentials(rows: WebhookRow[]): void {
   for (const row of rows) {
     delete row.secret;
     delete row.headers;
+  }
+}
+
+/**
+ * A delivery-failure row's `payload` is a short-lived replay copy of the event (a whole message body,
+ * cleared after WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS). It is not part of the record a backup keeps,
+ * and the importer never restores it, so it is left out of the archive rather than carried in it.
+ */
+function stripWebhookFailurePayload(rows: WebhookDeliveryFailureRow[]): void {
+  for (const row of rows) {
+    delete row.payload;
   }
 }
 
@@ -128,12 +147,42 @@ function stripBatchInlineMedia(row: MessageBatchRow, exceedsBudget: (encodedByte
   for (const entry of parsed) {
     const content = (entry as { content?: unknown } | null)?.content;
     if (typeof content !== 'object' || content === null) continue;
+    // A `base64` may be a placeholder whose payload sits in the item's variables, so those bytes are the field's
+    // too. A variable two fields share is stored once: it is charged to the first and dropped only if every
+    // field that names it was refused.
+    const rawVariables = (entry as { variables?: unknown }).variables;
+    const variables =
+      rawVariables && typeof rawVariables === 'object' && !Array.isArray(rawVariables)
+        ? (rawVariables as Record<string, unknown>)
+        : {};
+    const kept = new Set<string>();
+    const refused = new Set<string>();
     for (const key of ['image', 'video', 'audio', 'document']) {
       const media = (content as Record<string, unknown>)[key] as { base64?: unknown } | null | undefined;
       if (!media || typeof media !== 'object' || typeof media.base64 !== 'string') continue;
-      if (!exceedsBudget(Buffer.byteLength(media.base64, 'utf8'))) continue;
+      const template = media.base64;
+      // One pass over the template with the renderer's own grammar, whatever the number of variables.
+      const used = new Set(templateVariableNames(template));
+      const named = Object.keys(variables).filter(name => used.has(name) && variables[name] != null);
+      const scaffolding = renderTemplate(template, Object.fromEntries(named.map(name => [name, ''])));
+      const encodedBytes = named.reduce(
+        (bytes, name) => {
+          if (kept.has(name)) return bytes;
+          const value = variables[name];
+          return bytes + Buffer.byteLength(typeof value === 'string' ? value : JSON.stringify(value), 'utf8');
+        },
+        Buffer.byteLength(scaffolding, 'utf8'),
+      );
+      if (!exceedsBudget(encodedBytes)) {
+        for (const name of named) kept.add(name);
+        continue;
+      }
+      for (const name of named) refused.add(name);
       delete media.base64;
       stripped = true;
+    }
+    for (const name of refused) {
+      if (!kept.has(name)) delete variables[name];
     }
   }
   if (stripped) row.messages = JSON.stringify(parsed);
@@ -159,6 +208,8 @@ export interface ExportTable<K extends keyof MigrationTables = keyof MigrationTa
    * export, because a backup that silently omits them is worse than no backup.
    */
   optional?: boolean;
+  /** Columns read from SQL, excluding transient payloads before they can be materialized. */
+  columns?: readonly string[];
   /**
    * Rows carry an FK `sessionId` to sessions. The reads share no snapshot, so a session created after
    * `sessions` was read can leave child rows here that would fail the restore's FK check and roll the
@@ -264,7 +315,8 @@ export const EXPORT_TABLES: AnyExportTable[] = [
     sessionFk: true,
   }),
 
-  // The persisted lid->phone resolution cache. Not a FK to sessions (provenance only), so the
+  // The persisted lid->phone resolution cache. sessionId names the session whose negative may clear the
+  // phone; it is not a FK to sessions, so the
   // import's `DELETE FROM sessions` never clears it — it must be exported + re-inserted explicitly
   // or a backup→restore into a fresh DB loses the whole cache (it self-heals, but lossily).
   defineExportTable({ key: 'lidMappings', table: 'lid_mappings', optional: true }),
@@ -280,7 +332,25 @@ export const EXPORT_TABLES: AnyExportTable[] = [
   defineExportTable({ key: 'pluginInstances', table: 'plugin_instances', optional: true }),
   defineExportTable({ key: 'conversationMappings', table: 'conversation_mappings', optional: true }),
   defineExportTable({ key: 'ingressEvents', table: 'ingress_events', optional: true }),
-  defineExportTable({ key: 'webhookDeliveryFailures', table: 'webhook_delivery_failures', optional: true }),
+  defineExportTable({
+    key: 'webhookDeliveryFailures',
+    table: 'webhook_delivery_failures',
+    optional: true,
+    columns: [
+      'id',
+      'webhookId',
+      'sessionId',
+      'event',
+      'url',
+      'idempotencyKey',
+      'deliveryId',
+      'attempts',
+      'lastStatusCode',
+      'lastError',
+      'createdAt',
+    ],
+    afterRead: stripWebhookFailurePayload,
+  }),
   defineExportTable({ key: 'webhookOutboxEvents', table: 'webhook_outbox_events', optional: true }),
   defineExportTable({
     key: 'integrationDeliveryFailures',
@@ -306,5 +376,6 @@ export const EXPORT_TABLES: AnyExportTable[] = [
  * entity metadata does not report it.
  */
 export const EXPORT_TABLE_EXCLUSIONS: Readonly<Record<string, string>> = {
-  // (empty today: every data-connection entity table is exported)
+  // Claims expire within 24 hours; a restored key would only block or replay a send it never saw.
+  send_idempotency_keys: 'short-lived Idempotency-Key claims (24 h TTL), meaningless after a restore',
 };

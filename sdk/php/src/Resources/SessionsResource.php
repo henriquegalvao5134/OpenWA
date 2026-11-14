@@ -90,10 +90,9 @@ class SessionsResource
      */
     public function create(array $body): array
     {
-        // config is a map: an empty PHP array would serialize as a JSON list [] and be rejected by the
-        // gateway's object validation. Cast the empty map to stdClass so it encodes as {}.
-        if (isset($body['config']) && $body['config'] === []) {
-            $body['config'] = new \stdClass();
+        // Preserve object-map shape without writing through caller-held references.
+        if (isset($body['config']) && is_array($body['config'])) {
+            $body = array_merge($body, ['config' => (object) $body['config']]);
         }
         return $this->http->request('POST', '/api/sessions', [], $body);
     }
@@ -134,7 +133,9 @@ class SessionsResource
      * operation did not complete (no send, no acknowledgement, timeout/transport error, or local
      * cleanup failure); `phone` is cleared and no success audit is written. Start the session
      * again and retry the logout; do not assume the retry reconnects automatically or lands in a
-     * guaranteed QR state.
+     * guaranteed QR state. On Baileys, a session with no linked device throws on HTTP 409 instead:
+     * it was stopped locally, `phone` is cleared and no success audit is written. Start it to link
+     * a device, or delete it; retrying the logout cannot help.
      *
      * @return array<string,mixed>
      */
@@ -143,7 +144,15 @@ class SessionsResource
         return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($id)}/logout");
     }
 
-    /** @return array<string,mixed> */
+    /**
+     * Force-kill a stuck session (SIGKILL + teardown). Throws with HTTP 502 and
+     * getErrorCode() 'SESSION_FORCE_KILL_INCOMPLETE' when the session was stopped
+     * locally but the force-destroy threw or timed out, so the engine process may
+     * still be running; the status is settled to disconnected and a retry answers 400
+     * because no engine is left to kill. Restart the node to reap a leaked process.
+     *
+     * @return array<string,mixed>
+     */
     public function forceKill(string $id): array
     {
         return $this->http->request('POST', "/api/sessions/{$this->http->encodeSegment($id)}/force-kill");
@@ -156,6 +165,9 @@ class SessionsResource
     }
 
     /**
+     * Request an 8-character pairing code for phone-based login. On whatsapp-web.js, never request one for a
+     * number that already has a linked session: WhatsApp can revoke that device. Link it by QR instead.
+     *
      * @param array<string,mixed> $body
      * @return array<string,mixed>
      */

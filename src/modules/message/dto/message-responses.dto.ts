@@ -58,7 +58,7 @@ export class MessageListItemDto {
     type: String,
     nullable: true,
     description:
-      'Push name of the message sender as the engine reported it; in a group this is the member who posted, not the group subject. Null when no contact name was known.',
+      "Sender's push name, or their saved contact name when the engine reported no push name; in a group this is the member who posted, not the group subject. Null when neither was known.",
     example: 'Alice',
   })
   chatName?: string | null;
@@ -120,6 +120,11 @@ export class MessageListItemDto {
 }
 
 export class MessageListResponseDto {
+  @ApiPropertyOptional({
+    description:
+      'Rows matching the non-time filters with unknown message time, before time bounds. Present only for time selections; excluded from their messages and total. Stored history is not proof of complete remote history.',
+  })
+  unknownTimestampTotal?: number;
   @ApiProperty({ type: [MessageListItemDto], description: 'Newest first.' })
   messages!: MessageListItemDto[];
 
@@ -249,6 +254,17 @@ export class ChatHistoryProductDto {
   businessOwnerJid?: string;
 }
 
+export class ChatHistoryPollDto {
+  @ApiProperty({ example: 'Where?' })
+  name!: string;
+
+  @ApiProperty({ type: [String], example: ['Park', 'Beach'] })
+  options!: string[];
+
+  @ApiProperty({ example: false })
+  allowMultipleAnswers!: boolean;
+}
+
 /** OpenAPI mirror of the engine `IncomingMessage` served by the live chat-history route. */
 export class ChatHistoryMessageDto {
   @ApiProperty({ example: 'true_628123456789@c.us_3EB0123456789' })
@@ -297,6 +313,18 @@ export class ChatHistoryMessageDto {
   @ApiPropertyOptional({ type: [String], description: 'WIDs @mentioned in the message.' })
   mentionedIds?: string[];
 
+  @ApiPropertyOptional({
+    description: 'True when the sender forwarded this message rather than writing it. Absent otherwise.',
+    example: true,
+  })
+  isForwarded?: boolean;
+
+  @ApiPropertyOptional({
+    description: 'How many times the message has been forwarded. Set with `isForwarded`.',
+    example: 1,
+  })
+  forwardingScore?: number;
+
   @ApiPropertyOptional({ type: ChatHistoryCallDto, description: 'Set for `call` messages.' })
   call?: ChatHistoryCallDto;
 
@@ -327,6 +355,9 @@ export class ChatHistoryMessageDto {
   @ApiPropertyOptional({ type: ChatHistoryQuotedMessageDto })
   quotedMessage?: ChatHistoryQuotedMessageDto;
 
+  @ApiPropertyOptional({ type: ChatHistoryPollDto, description: 'Poll choices and selection mode, when available.' })
+  poll?: ChatHistoryPollDto;
+
   @ApiPropertyOptional({ type: ChatHistoryLocationDto })
   location?: ChatHistoryLocationDto;
 
@@ -355,4 +386,33 @@ export class MessageReactionDto {
 
   @ApiProperty({ type: [MessageReactionSenderDto], description: 'Who placed this emoji.' })
   senders!: MessageReactionSenderDto[];
+}
+
+export class MessageReceiptParticipantDto {
+  @ApiProperty({ example: '628123456789@c.us', description: 'Participant WhatsApp ID' })
+  participant!: string;
+
+  @ApiProperty({ description: 'Unix seconds the receipt occurred.', example: 1700000010 })
+  timestamp!: number;
+}
+
+/** OpenAPI mirror of the engine `MessageReceipts` served by the receipts route. */
+export class MessageReceiptsResponseDto {
+  @ApiProperty({ type: [MessageReceiptParticipantDto], description: 'Participants who received the message' })
+  delivery!: MessageReceiptParticipantDto[];
+
+  @ApiPropertyOptional({ description: 'Number of participants remaining to receive', example: 0 })
+  deliveryRemaining?: number;
+
+  @ApiProperty({ type: [MessageReceiptParticipantDto], description: 'Participants who read the message' })
+  read!: MessageReceiptParticipantDto[];
+
+  @ApiPropertyOptional({ description: 'Number of participants remaining to read', example: 0 })
+  readRemaining?: number;
+
+  @ApiProperty({ type: [MessageReceiptParticipantDto], description: 'Participants who played the audio/voice message' })
+  played!: MessageReceiptParticipantDto[];
+
+  @ApiPropertyOptional({ description: 'Number of participants remaining to play', example: 0 })
+  playedRemaining?: number;
 }

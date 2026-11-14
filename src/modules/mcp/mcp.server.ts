@@ -4,6 +4,8 @@ import type { HttpAdapterHost } from '@nestjs/core';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { AnySchema } from '@modelcontextprotocol/sdk/server/zod-compat.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
+import type { ChatScopeService } from '../auth/chat-scope.service';
 import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js';
 import type { ServerNotification, ServerRequest } from '@modelcontextprotocol/sdk/types.js';
 import express, { type Request, type RequestHandler, type Response } from 'express';
@@ -13,11 +15,11 @@ import { UnresolvedApiKeyException, type AuthService } from '../auth/auth.servic
 import { allowUnauthenticatedAuditRow } from '../audit/auth-failure-audit-limiter';
 import type { AuditService } from '../audit/audit.service';
 import { AuditAction } from '../audit/entities/audit-log.entity';
-import { handleToolError, jsonToolResult, smartToolResult } from './tool-result';
+import { handleToolError, smartToolResult } from './tool-result';
 import type { KeyRateLimiter } from './mcp-rate-limit';
-import { limiterKeyForIp, resolveClientIp } from '../../common/utils/ip';
+import { limiterKeyForIp, parseTrustedProxies, resolveClientIp } from '../../common/utils/ip';
 import { resolveBodyLimit } from '../../config/bootstrap-security';
-import { bearerToken } from '../../common/security/bearer-token';
+import { presentedApiKey } from '../../common/security/bearer-token';
 
 const logger = createLogger('McpServer');
 
@@ -32,17 +34,12 @@ export interface McpRequestContext {
 }
 
 /**
- * Extract the raw API key from request headers. Accepts X-Api-Key or Bearer token. The one parser for
- * both the mount gate (Express headers) and the per-tool check (the SDK's request headers), so the two
- * cannot disagree on what the credential is.
+ * Extract the raw API key from request headers. Accepts X-Api-Key or Bearer token. The mount gate parses
+ * the Express headers and hands the key it validated to the per-tool check as `authInfo`, so the two
+ * cannot disagree on what the credential is (the SDK's own header copy joins duplicate headers).
  */
 function extractApiKey(headers: Record<string, string | string[] | undefined> = {}): string | undefined {
-  const xApiKey = headers['x-api-key'];
-  if (xApiKey) {
-    return Array.isArray(xApiKey) ? xApiKey[0] : xApiKey;
-  }
-  const auth = headers['authorization'];
-  return bearerToken(Array.isArray(auth) ? auth[0] : auth);
+  return presentedApiKey(headers);
 }
 
 /**
@@ -75,10 +72,7 @@ export function auditMcpAuthFailure(
 
 /** Read TRUSTED_PROXIES once as a list (shared by the pre-auth throttle and the audit IP resolver). */
 function readTrustedProxies(): string[] {
-  return (process.env.TRUSTED_PROXIES ?? '')
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean);
+  return parseTrustedProxies(process.env.TRUSTED_PROXIES);
 }
 
 /** Resolve the trusted-proxy-aware client IP + HTTP method/path for an audit record. */
@@ -89,6 +83,14 @@ function resolveReqContext(req: Request): McpRequestContext {
     path: req.path,
   };
 }
+
+/**
+ * The most array items and object keys, nested ones included, a tool call may carry. The SDK counts them before
+ * it validates, so a call past it is refused at once; below it, one wrong value in a `vars` map costs one issue
+ * line per entry, and a map of tens of thousands answered with megabytes. REST bounds a body the same way
+ * (docs/04). The widest input a tool takes is a list of a few hundred ids.
+ */
+export const MCP_MAX_TOOL_INPUT_ELEMENTS = 10_000;
 
 /**
  * Build the MCP server ONCE and register all tools from the registry.
@@ -103,10 +105,11 @@ function buildServer(
   serverInfo: { name: string; version: string },
   auditService: AuditService | undefined,
   reqContext: McpRequestContext,
+  chatScope?: ChatScopeService,
 ): McpServer {
   const server = new McpServer(
     { name: serverInfo.name, version: serverInfo.version },
-    { capabilities: { tools: {}, logging: {} } },
+    { capabilities: { tools: {}, logging: {} }, maxToolInputElements: MCP_MAX_TOOL_INPUT_ELEMENTS },
   );
 
   const tools = registry.list({ readOnly });
@@ -126,7 +129,7 @@ function buildServer(
         },
       },
       async (input: Record<string, unknown>, extra: ToolExtra) => {
-        const rawKey = extractApiKey(extra.requestInfo?.headers);
+        const rawKey = extra.authInfo?.token ?? extractApiKey(extra.requestInfo?.headers);
         try {
           const result = await invokeTool(
             tool,
@@ -136,13 +139,13 @@ function buildServer(
             id => rateLimiter.check(id),
             // onAuthFailure: mirror the REST ApiKeyGuard — record rejected/denied auth attempts (401/403
             // only) at the auth boundary so the audit trail covers MCP credential probing. Fires inside
-            // invokeTool's auth phase (before the tool handler), so handler-thrown 403s are NOT mislabeled
+            // invokeTool's authorization checks (before the tool handler), so handler-thrown 403s are NOT mislabeled
             // as auth failures. Best-effort; success and non-auth errors skip this.
             error => auditMcpAuthFailure(auditService, error, reqContext),
+            chatScope,
+            extra.signal,
           );
-          return tool.resultDisposition === 'json'
-            ? jsonToolResult(result as object)
-            : smartToolResult(result as object);
+          return smartToolResult(result as object);
         } catch (error) {
           return handleToolError(error);
         }
@@ -215,6 +218,8 @@ export function createKeyGate(
       const rawKey = extractApiKey(req.headers);
       if (!rawKey) throw new UnresolvedApiKeyException('Missing API key');
       await authService.validateApiKey(rawKey, undefined, undefined, { recordUsage: false });
+      // The transport forwards req.auth to every tool call as extra.authInfo.
+      (req as Request & { auth?: AuthInfo }).auth = { token: rawKey, clientId: 'api-key', scopes: [] };
     } catch (err) {
       if (err instanceof HttpException) {
         auditMcpAuthFailure(auditService, err, resolveReqContext(req));
@@ -249,6 +254,7 @@ export function mountMcpServer(
   ipRateLimiter: KeyRateLimiter,
   options: MountMcpServerOptions = {},
   auditService?: AuditService,
+  chatScope?: ChatScopeService,
 ): void {
   const basePath = (options.basePath ?? '/mcp').replace(/\/$/, '') || '/mcp';
   const serverInfo = options.serverInfo ?? { name: 'openwa', version: '0.0.0' };
@@ -269,6 +275,7 @@ export function mountMcpServer(
       serverInfo,
       auditService,
       resolveReqContext(req),
+      chatScope,
     );
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     try {
@@ -289,7 +296,7 @@ export function mountMcpServer(
   type Mount = (path: string, ...handlers: RequestHandler[]) => unknown;
   const adapter = httpAdapter as unknown as { post: Mount; get: Mount; delete: Mount };
   // The route throttle gates the auth DB lookup and per-request MCP server/transport construction. The
-  // process-wide capped json() in main.ts runs first for all routes; this route-level parser is a
+  // process-wide capped json() in src/configure-app.ts runs first for all routes; this route-level parser is a
   // defensive fallback and no-ops once the global parser has consumed the body. It sits before the
   // throttle so the throttle always sees a parsed body and can charge a batch per message.
   // `inflate: false` matches the global parsers: a compressed body is refused by the budget

@@ -139,6 +139,22 @@ test('every session-scope API key string resolves in every locale', () => {
   }
 });
 
+test('the passkey restriction label and note resolve in every locale, and the note names the passkey', () => {
+  for (const lng of LOCALE_IDS) {
+    for (const key of ['sessions.restriction.passkey_required', 'sessions.restriction.passkey_required_note']) {
+      const value = i18n.t(key, { lng });
+      assert.ok(value && value !== key, `${lng}: ${key} missing from the catalog (the card would show a raw key)`);
+    }
+    // The note says what WhatsApp asked for and that OpenWA does not answer it; a label pasted into both
+    // places would resolve and say neither.
+    const note = i18n.t('sessions.restriction.passkey_required_note', { lng });
+    const label = i18n.t('sessions.restriction.passkey_required', { lng });
+    assert.notEqual(note, label, `${lng}: the note repeats the label`);
+    assert.ok(note.includes('OpenWA'), `${lng}: the note does not say that OpenWA cannot answer the request`);
+  }
+  assert.equal(i18n.t('sessions.restriction.passkey_required', { lng: 'en' }), 'Passkey required');
+});
+
 test('English session-scope copy explains the empty-allowlist default', () => {
   assert.equal(i18n.t('apiKeys.sessions.all'), 'All sessions');
   assert.equal(i18n.t('apiKeys.sessions.choose'), 'Choose sessions');
@@ -269,6 +285,16 @@ test('English backup hint says which credentials the export leaves out and which
   );
 });
 
+test("English '*' event description names the one event the wildcard leaves out", () => {
+  const all = i18n.t('webhooks.eventDescriptions.all', { lng: 'en' });
+  assert.match(
+    all,
+    /except message\.receipt/,
+    `the '*' description does not say it leaves out message.receipt: "${all}"`,
+  );
+  assert.ok(!/^all events$/i.test(all), `the '*' description claims every event: "${all}"`);
+});
+
 test('English start teardown-pending copy is a retryable warning, not an error', () => {
   const title = i18n.t('sessions.start.teardownPendingTitle', { lng: 'en' });
   const body = i18n.t('sessions.start.teardownPending', { lng: 'en' });
@@ -354,6 +380,28 @@ test('no locale catalogue is imported statically, anywhere in the dashboard sour
   assert.deepEqual(offenders, [], 'a static locale import is back — those languages are on the critical path again');
 });
 
+// The parity gate compares the other catalogues with en.json and never reads the source, and a
+// component test that builds its expected label with t() passes on the raw key too. So a literal key
+// that no catalogue has would render to the operator as the key itself. Template-literal and variable
+// keys are out of reach of this scan.
+const LITERAL_KEY = /\bt\(\s*['"]([a-zA-Z][\w-]*(?:\.[\w-]+)+)['"]|i18nKey=['"]([\w.-]+)['"]/g;
+
+test('every literal t() and i18nKey key in the dashboard source resolves in every locale', () => {
+  const keys = new Set(
+    readdirSync(SRC_DIR, { recursive: true, withFileTypes: true })
+      .filter(entry => entry.isFile() && /\.tsx?$/.test(entry.name) && !/\.test\.tsx?$/.test(entry.name))
+      .flatMap(entry => [...readFileSync(join(entry.parentPath, entry.name), 'utf8').matchAll(LITERAL_KEY)])
+      .map(m => m[1] ?? m[2]),
+  );
+  assert.ok(keys.size > 500, `only ${keys.size} literal keys found, the scan pattern has drifted`);
+  const missing = LOCALE_IDS.flatMap(lng =>
+    [...keys]
+      .filter(key => !i18n.exists(key, { lng }) && !i18n.exists(`${key}_other`, { lng }))
+      .map(key => `${lng}: ${key}`),
+  );
+  assert.deepEqual(missing, [], 'these keys would render as the raw key');
+});
+
 // rtlLanguages is deliberately a SUBSET (only he/ar today), so it is checked for validity, not parity:
 // an id here that is not a shipped locale would set dir="rtl" for a language that cannot be selected.
 test('rtlLanguages only names shipped locales', () => {
@@ -393,4 +441,45 @@ test('the Templates nav item reads the same as the page it opens in every locale
   for (const lng of LOCALE_IDS) {
     assert.equal(i18n.t('nav.templates', { lng }), i18n.t('templates.title', { lng }), `${lng} nav.templates`);
   }
+});
+
+// A confirm dialog sets its action beside Cancel, so a label that does not mean Cancel must not read as that
+// locale's Cancel: two buttons reading Cancel leave nothing to tell the one that acts from the one that backs out.
+test("no label reads as its locale's Cancel unless it means Cancel", () => {
+  const leaves = (node: unknown, path = ''): [string, unknown][] =>
+    node && typeof node === 'object'
+      ? Object.entries(node).flatMap(([key, value]) => leaves(value, path ? `${path}.${key}` : key))
+      : [[path, node]];
+  const english = new Map(leaves(resources.en.translation));
+  for (const lng of LOCALE_IDS) {
+    const cancel = i18n.t('common.cancel', { lng });
+    const lookalikes = leaves(resources[lng].translation)
+      .filter(([key, value]) => value === cancel && english.get(key) !== english.get('common.cancel'))
+      .map(([key]) => key);
+    assert.deepEqual(lookalikes, [], `${lng} labels that read as its Cancel`);
+  }
+});
+
+// Both databases apply their pending migrations at startup unless *_SYNCHRONIZE=true opts into
+// TypeORM synchronize, so the Infrastructure card must not name synchronize as the default.
+test('English migrations status describes migrations, not schema synchronize', () => {
+  const status = i18n.t('infrastructure.database.migrationsStatus', { lng: 'en' });
+  assert.doesNotMatch(status, /synchroni[sz]/i, `status names synchronize: "${status}"`);
+  assert.match(status, /migrations/i, `status lost the migrations wording: "${status}"`);
+});
+
+// Session auth state lives on disk or in the database; Redis only backs the cache, the queues, the
+// rate-limit counters and the multi-node WebSocket fan-out.
+test('English Redis copy does not claim Redis stores sessions', () => {
+  for (const key of ['infrastructure.redis.enableDesc', 'infrastructure.redis.disabledDesc']) {
+    const copy = i18n.t(key, { lng: 'en' });
+    assert.doesNotMatch(copy, /session/i, `${key} claims session storage: "${copy}"`);
+  }
+});
+
+// Plugin config, session activation and per-session overrides all apply live; a restart the toast
+// asks for would only drop every WhatsApp session for nothing.
+test('English plugin save toast does not ask for a server restart', () => {
+  const desc = i18n.t('plugins.toasts.savedDesc', { lng: 'en' });
+  assert.doesNotMatch(desc, /restart required/i, `toast asks for a restart: "${desc}"`);
 });

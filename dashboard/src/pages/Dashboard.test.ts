@@ -4,17 +4,21 @@
 // the gateway never returned. POST /sessions/:id/stop
 // is OPERATOR-only: a viewer is offered no Disconnect, and a failed stop is reported, not swallowed.
 import '../test-helpers/register-hooks.ts';
-import { test, before, afterEach } from 'node:test';
+import { test, before, afterEach, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { createElement } from 'react';
 import { MemoryRouter } from 'react-router-dom';
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { QueryClient, QueryClientProvider, environmentManager } from '@tanstack/react-query';
 
 let webhooksStatus = 403;
 let webhookList: unknown[] = [];
 let sessionList: unknown[] = [];
 let stopStatus = 200;
 let sessionsStatus = 200;
+let holdWebhooks = false;
+// Whether GET /sessions/stats/overview answers; refused by default, as for a key the route does not admit.
+let statsReadable = false;
 const requested: string[] = [];
 
 function jsonResponse(data: unknown, status = 200): Response {
@@ -47,7 +51,14 @@ function installFetchStub(): void {
           : jsonResponse({ message: 'Engine not loaded' }, stopStatus),
       );
     }
+    if (path === '/api/sessions/stats/overview' && statsReadable) {
+      const memoryUsage = { heapUsed: 0, heapTotal: 0, rss: 0 };
+      return Promise.resolve(
+        jsonResponse({ total: 1, active: 1, ready: 1, disconnected: 0, byStatus: { ready: 1 }, memoryUsage }),
+      );
+    }
     if (path === '/api/webhooks') {
+      if (holdWebhooks) return new Promise<Response>(() => {});
       return webhooksStatus === 200
         ? Promise.resolve(jsonResponse(webhookList))
         : Promise.resolve(jsonResponse({ message: 'Insufficient permissions. Required: operator' }, webhooksStatus));
@@ -92,8 +103,11 @@ afterEach(() => {
   sessionList = [];
   stopStatus = 200;
   sessionsStatus = 200;
+  holdWebhooks = false;
+  statsReadable = false;
   requested.length = 0;
   window.sessionStorage.setItem('openwa_user_role', 'viewer');
+  window.sessionStorage.removeItem('openwa_key_scoped');
 });
 
 function renderDashboard(): void {
@@ -115,6 +129,47 @@ function statValue(label: string): string {
   const card = rtl.screen.getByText(label).closest('.stat-card');
   return card?.querySelector('.stat-value')?.textContent ?? '';
 }
+
+// The overview holds no socket and its reads were only marked stale after 30 s, which refetches nothing by itself: a tab
+// kept open and focused showed a session that had dropped as connected until the window lost and regained focus.
+// Polls run on a clock the test moves. React Query decides it runs on a server when it loads before jsdom's window, as
+// it does here, and then schedules no refetch timer at all; a browser always has a window.
+function pollOnTestClock(t: TestContext): void {
+  const wasServer = environmentManager.isServer();
+  environmentManager.setIsServer(() => false);
+  t.after(() => environmentManager.setIsServer(() => wasServer));
+  t.mock.timers.enable({ apis: ['setInterval'] });
+}
+
+const sessionReads = () => [
+  requested.filter(path => path === '/api/sessions').length,
+  requested.filter(path => path === '/api/sessions/stats/overview').length,
+];
+
+test('the overview reads the sessions and their statistics again while it stays open', async t => {
+  pollOnTestClock(t);
+  sessionList = [READY_SESSION];
+  statsReadable = true;
+  renderDashboard();
+  await rtl.screen.findByText('Main');
+  const [sessions, stats] = sessionReads();
+
+  rtl.act(() => t.mock.timers.tick(30_000));
+  assert.deepEqual(sessionReads(), [sessions + 1, stats + 1], 'the overview did not read the sessions again');
+});
+
+// A key the session routes refuse (one restricted to selected chats is refused both) is refused, and audited as a failed
+// authentication, on every read: polled, that would be two more refusals every 30 s for as long as the tab stays open.
+test('a refused read of the sessions or their statistics is not polled again', async t => {
+  pollOnTestClock(t);
+  sessionsStatus = 403;
+  renderDashboard();
+  await rtl.screen.findByRole('alert');
+  const before = sessionReads();
+
+  rtl.act(() => t.mock.timers.tick(90_000));
+  assert.deepEqual(sessionReads(), before, 'a refused read was sent again');
+});
 
 test('a refused webhook read shows the unavailable placeholder, not zero webhooks', async () => {
   webhooksStatus = 403;
@@ -145,7 +200,44 @@ test('a successful empty webhook read still counts zero', async () => {
   window.sessionStorage.setItem('openwa_user_role', 'operator');
   renderDashboard();
   await rtl.screen.findByText('Webhooks Configured');
-  await rtl.waitFor(() => assert.equal(statValue('Webhooks Configured'), '0'));
+  await rtl.waitFor(() => assert.equal(queryClient!.getQueryState(['webhooks'])?.status, 'success'));
+  assert.equal(statValue('Webhooks Configured'), '0');
+});
+
+test('a webhook read still in flight shows the placeholder, not zero webhooks', async () => {
+  holdWebhooks = true;
+  window.sessionStorage.setItem('openwa_user_role', 'operator');
+  renderDashboard();
+  await rtl.screen.findByText('Webhooks Configured');
+  await rtl.waitFor(() => assert.ok(requested.includes('/api/webhooks')));
+  assert.equal(statValue('Webhooks Configured'), statValue('Messages Today'));
+  assert.notEqual(statValue('Webhooks Configured'), '0');
+});
+
+// A date-only formatter put a session active a few hours ago on a bare date.
+test('a session last active a few hours ago reads in hours, not as a date', async () => {
+  webhooksStatus = 403;
+  sessionList = [{ ...READY_SESSION, lastActive: new Date(Date.now() - 5 * 3_600_000).toISOString() }];
+  renderDashboard();
+  await rtl.screen.findByText('Main');
+  assert.equal(document.querySelector('.last-active')?.textContent, '5 hours ago');
+});
+
+// The harness refuses the session statistics, as the gateway does a failed or unsent read: the count of sessions is
+// then the list's own, not a total of zero beside the rows on screen.
+test('a session list without statistics is counted by its own length', async () => {
+  sessionList = [READY_SESSION];
+  renderDashboard();
+  await rtl.screen.findByText('Main');
+  assert.equal(document.querySelector('.section-subtitle')?.textContent, 'Showing 1 of 1 sessions');
+});
+
+test('a connected session is counted without statistics, in the card and the header badge', async () => {
+  sessionList = [READY_SESSION, { ...READY_SESSION, id: 'sess-2', name: 'Spare', status: 'disconnected' }];
+  renderDashboard();
+  await rtl.screen.findByText('Main');
+  assert.equal(statValue('Connected Sessions'), '1');
+  assert.equal(document.querySelector('.status-badge')?.textContent, 'Connected');
 });
 
 test('a read-only key is offered no Disconnect', async () => {
@@ -208,7 +300,8 @@ test('a failed first read of the sessions still shows the error', async () => {
   webhooksStatus = 200;
   sessionsStatus = 502;
   renderDashboard();
-  await rtl.screen.findByText(/Bad Gateway/);
+  const alert = await rtl.screen.findByRole('alert');
+  assert.match(alert.textContent ?? '', /Bad Gateway/);
 });
 
 test('a non-admin key never loads the chart section', async () => {
@@ -243,4 +336,29 @@ test('an admin key loads the chart section', async () => {
   window.sessionStorage.setItem('openwa_user_role', 'admin');
   renderDashboard();
   await rtl.waitFor(() => assert.ok(requested.some(p => p.startsWith('/api/stats/messages'))));
+});
+
+test('a session-scoped admin key never loads the cross-session statistics', async () => {
+  // GET /stats/overview and /stats/messages refuse a key restricted to selected sessions, whatever its role.
+  window.sessionStorage.setItem('openwa_user_role', 'admin');
+  window.sessionStorage.setItem('openwa_key_scoped', 'true');
+  renderDashboard();
+  await rtl.waitFor(() => assert.ok(requested.includes('/api/sessions')));
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.ok(!requested.includes('/api/stats/overview'), 'the overview was requested');
+  assert.ok(!requested.some(p => p.startsWith('/api/stats/messages')), 'the charts asked for /stats/messages');
+});
+
+// The session table renders `status-pill ${session.status}`, so every status needs its own colour.
+test('the status pill styles every session status and nothing else', () => {
+  const entity = readFileSync(
+    new URL('../../../src/modules/session/entities/session.entity.ts', import.meta.url),
+    'utf8',
+  );
+  const block = /export enum SessionStatus \{([^}]*)\}/.exec(entity)?.[1] ?? '';
+  const statuses = [...block.matchAll(/= '([a-z_]+)'/g)].map(m => m[1]).sort();
+  assert.ok(statuses.length > 0, 'SessionStatus was not found');
+  const css = readFileSync(new URL('./Dashboard.css', import.meta.url), 'utf8');
+  const styled = [...new Set([...css.matchAll(/\.dashboard \.status-pill\.([a-z_]+)/g)].map(m => m[1]))].sort();
+  assert.deepEqual(styled, statuses);
 });

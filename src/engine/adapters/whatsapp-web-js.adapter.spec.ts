@@ -1,28 +1,47 @@
 import { Client, MessageMedia, WAState } from 'whatsapp-web.js';
 import { EventEmitter } from 'events';
+import { WhatsAppWebJsAdapter } from './whatsapp-web-js.adapter';
+import { extractLinkedParentJID } from './wwebjs-groups';
 import {
-  WhatsAppWebJsAdapter,
-  extractLinkedParentJID,
+  downloadMediaInPage,
   isHttpUrl,
-  isSupportedProxyUrl,
-  isExecutionContextDestroyedError,
-  buildProxyLaunchConfig,
   loadRemoteMedia,
+  extractWwebjsCall,
+  wwebjsAckToDeliveryStatus,
+} from './wwebjs-messaging';
+import { isSupportedProxyUrl, buildProxyLaunchConfig } from './wwebjs-proxy';
+import { LoggerService } from '../../common/services/logger.service';
+import {
+  resolveOnboardingContinueLabels,
   probeOnboardingModal,
   collectDialogDiagnostics,
-  resolveAuthTimeoutMs,
-  wwebjsAckToDeliveryStatus,
-  extractWwebjsCall,
-  READY_RECONCILE_TIMEOUT_MS,
-  READY_RECONCILE_BRIDGE_RELOAD_GRACE_MS,
+  type WwebjsOnboardingWatcher,
+} from './wwebjs-onboarding';
+import {
+  isExecutionContextDestroyedError,
   NAVIGATION_REINJECT_GRACE_MS,
   NAVIGATION_EPISODE_CAP_MS,
-} from './whatsapp-web-js.adapter';
-import { resolveOnboardingContinueLabels } from './wwebjs-onboarding';
+  PAGE_RELOADING_MESSAGE,
+  type WwebjsLifecycle,
+} from './wwebjs-lifecycle';
+import { READY_RECONCILE_TIMEOUT_MS, READY_RECONCILE_BRIDGE_RELOAD_GRACE_MS } from './wwebjs-reconcile';
+import { DEFAULT_PUPPETEER_ARGS, PINNED_BROWSER_LOCALE } from '../../config/configuration';
+import { type WwebjsCalls } from './wwebjs-calls';
+import * as patchStatus from './engine-patch-status';
 import { getEffectiveWebVersionInfo, resolveWebVersionPin, __resetWebVersionCache } from '../wa-web-version';
-import { resolveEngineInitTimeoutMs } from '../engine-init-timeout';
+import { resolveAuthTimeoutMs, resolveEngineInitTimeoutMs } from '../engine-init-timeout';
 import * as fs from 'fs';
+import { createHash, randomUUID } from 'crypto';
+import { DataSource } from 'typeorm';
+import { EngineRegistry } from '../engine-registry.service';
+import { LidMapping } from '../identity/lid-mapping.entity';
+import { LidMappingStoreService } from '../identity/lid-mapping-store.service';
+import { Session } from '../../modules/session/entities/session.entity';
+import { SessionLidResolver } from '../../modules/session/session-lid-resolver.service';
+import { ChatScopeService } from '../../modules/auth/chat-scope.service';
 import * as path from 'path';
+import * as ts from 'typescript';
+import * as vm from 'vm';
 import * as qrcode from 'qrcode';
 import { InternalServerErrorException, UnprocessableEntityException, BadRequestException } from '@nestjs/common';
 import { EngineNotReadyError } from '../../common/errors/engine-not-ready.error';
@@ -34,12 +53,15 @@ import { RecipientUnreachableError } from '../../common/errors/recipient-unreach
 import { EditedMessage, EngineStatus, GroupEvent, IncomingCallEvent } from '../interfaces/whatsapp-engine.interface';
 import { EngineRefusedError } from '../../common/errors/engine-refused.error';
 import { EngineTransportError } from '../../common/errors/engine-transport.error';
+import { provesNothingSent } from '../../common/errors/engine-not-sent.error';
+import { readCurrentLid } from './wwebjs-contacts';
 import { InvalidInviteCodeError } from '../../common/errors/invalid-invite-code.error';
 import { GroupNotFoundError } from '../../common/errors/group-not-found.error';
 import { LabelNotFoundError } from '../../common/errors/label-not-found.error';
 import { SsrfBlockedError } from '../../common/security/ssrf-guard';
 import * as loadRemoteMediaModule from '../../common/media/load-remote-media';
 import { fetch as undiciFetch } from 'undici';
+import { lookup } from 'dns/promises';
 
 // Allowlisted hosts are PINNED to their DNS answer (ssrf-guard pins allowlisted hosts to their DNS answers), so the specs that exercise
 // the SSRF_ALLOWED_HOSTS escape-hatch need a deterministic resolver. Default answers are PUBLIC
@@ -72,6 +94,15 @@ jest.mock('qrcode', () => ({
 // namespace wrapper that `import * as childProcess` yields has non-configurable members, so
 // jest.spyOn cannot redefine execFile on it. The adapter reads execFile live off this same object.
 const childProcess = jest.requireActual<typeof import('child_process')>('child_process');
+
+/**
+ * Serve a message's media download from `download`: production reads it through the page
+ * (downloadCappedMedia), and the same mock stays reachable as `downloadMedia` for assertions.
+ */
+const onPage = <T extends jest.Mock>(download: T) => ({
+  downloadMedia: download,
+  client: { pupPage: { evaluate: download } },
+});
 
 describe('wwebjsAckToDeliveryStatus (engine ack-int -> neutral DeliveryStatus boundary, #265)', () => {
   // Regression-locks the integer boundary the decoupling moved behaviour into, incl. the
@@ -207,8 +238,8 @@ describe('WhatsAppWebJsAdapter initialize() failure reason (#1081)', () => {
 });
 
 // A WhatsApp Web page navigation during the FIRST inject rejects Client.initialize() before the
-// library's own framenavigated re-inject handler exists (Client.js:502 vs :504), so nothing upstream
-// retries it — and the adapter's onError channel is terminal. One in-adapter retry converts that
+// library's own framenavigated re-inject handler exists (it is added after the first inject() resolves), so
+// nothing upstream retries it — and the adapter's onError channel is terminal. One in-adapter retry converts that
 // one-navigation death into a normal slow start (#1081).
 describe('WhatsAppWebJsAdapter initialize() retry on a navigation-killed first inject (#1081)', () => {
   const newAdapter = (): WhatsAppWebJsAdapter =>
@@ -380,9 +411,28 @@ describe('WhatsAppWebJsAdapter initialize() retry on a navigation-killed first i
     });
     const onError = jest.fn();
 
-    await expect(adapter.initialize({ onError })).rejects.toThrow(EXEC_CTX);
+    await expect(adapter.initialize({ onError })).resolves.toBeUndefined();
 
     expect(clientInitSpy).toHaveBeenCalledTimes(1);
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  // The stop's destroy closes the browser, which rejects the pending launch. That rejection is the
+  // stop landing, not a start failure: no FAILED status, no onError, like the other teardown exits.
+  it('settles DISCONNECTED without onError when a stop closes the launching browser', async () => {
+    const adapter = newAdapter();
+    const states: EngineStatus[] = [];
+    clientInitSpy.mockImplementationOnce(async () => {
+      await adapter.disconnect();
+      throw new Error('Protocol error (Runtime.callFunctionOn): Target closed');
+    });
+    const onError = jest.fn();
+
+    await expect(adapter.initialize({ onError, onStateChanged: state => states.push(state) })).resolves.toBeUndefined();
+
+    expect(onError).not.toHaveBeenCalled();
+    expect(states).not.toContain(EngineStatus.FAILED);
+    expect(adapter.getStatus()).toBe(EngineStatus.DISCONNECTED);
   });
 
   // A stop, delete or logout that lands while Chromium is still launching runs Client.destroy()
@@ -633,7 +683,13 @@ describe('loadRemoteMedia — routes through the SSRF-pinned media fetch', () =>
   });
 
   it('honors the SSRF_ALLOWED_HOSTS escape-hatch for trusted internal media stores', async () => {
+    // 'minio' resolves to a private address, so only the allow-list can let it through.
+    jest.mocked(lookup).mockResolvedValueOnce([{ address: '10.0.0.5', family: 4 }] as never);
+    await expect(loadRemoteMedia('http://minio:9000/bucket/x.png', undefined)).rejects.toBeInstanceOf(SsrfBlockedError);
+    expect(undiciFetch).not.toHaveBeenCalled();
+
     process.env.SSRF_ALLOWED_HOSTS = 'minio';
+    jest.mocked(lookup).mockResolvedValueOnce([{ address: '10.0.0.5', family: 4 }] as never);
     (undiciFetch as jest.Mock).mockResolvedValue(fakeResponse([1], { 'content-type': 'image/png' }));
 
     const media = await loadRemoteMedia('http://minio:9000/bucket/x.png', undefined);
@@ -922,7 +978,7 @@ describe('WhatsAppWebJsAdapter.getChatHistory enrichment (parity with the live p
       hasMedia: true,
       hasQuotedMsg: false,
       _data: { size: 12 * 1024 * 1024, mimetype: 'image/jpeg' },
-      downloadMedia: jest.fn(),
+      ...onPage(jest.fn()),
     };
     const chat = { fetchMessages: jest.fn().mockResolvedValue([mediaMsg]) };
     const client = { getChatById: jest.fn().mockResolvedValue(chat) };
@@ -952,7 +1008,7 @@ describe('WhatsAppWebJsAdapter.getChatHistory enrichment (parity with the live p
       hasMedia: true,
       hasQuotedMsg: false,
       _data: { size: data.length, mimetype: 'image/jpeg' },
-      downloadMedia: jest.fn().mockResolvedValue({ data, mimetype: 'image/jpeg' }),
+      ...onPage(jest.fn().mockResolvedValue({ data, mimetype: 'image/jpeg' })),
     });
     const clientFor = (...msgs: unknown[]) => ({
       getChatById: jest.fn().mockResolvedValue({ fetchMessages: jest.fn().mockResolvedValue(msgs) }),
@@ -1000,6 +1056,29 @@ describe('WhatsAppWebJsAdapter.getChatHistory enrichment (parity with the live p
       expect(out[0].media).toEqual({ mimetype: 'image/jpeg', data: 'QUJD' });
       expect(out[1].media).toEqual({ mimetype: 'image/jpeg', data: 'QUJD' });
       expect(m2.downloadMedia).toHaveBeenCalled();
+    });
+
+    // The per-item cap is clamped to MEDIA_DOWNLOAD_MAX_BYTES, so an override above it must not
+    // inflate the aggregate budget derived from it either.
+    it('derives the per-item-cap budget from the clamped cap, not a larger override', async () => {
+      process.env[ENV] = '4';
+      const origMax = process.env.MEDIA_DOWNLOAD_MAX_BYTES;
+      process.env.MEDIA_DOWNLOAD_MAX_BYTES = '3'; // budget = ceil(3 * 4 * 1.37) = 17 base64 chars
+      try {
+        const msgs = ['M16', 'M17', 'M18', 'M19', 'M20', 'M21'].map(id => ({
+          ...mediaMsg(id, 'QUJD'),
+          _data: { size: 3, mimetype: 'image/jpeg' },
+        }));
+
+        const out = await readyAdapter(clientFor(...msgs)).getChatHistory('status@broadcast', 50, true, 1024 * 1024);
+
+        expect(out.slice(0, 5).map(m => m.media)).toEqual(Array(5).fill({ mimetype: 'image/jpeg', data: 'QUJD' }));
+        expect(out[5].media).toEqual({ mimetype: 'image/jpeg', omitted: true, sizeBytes: 3 });
+        expect(msgs[5].downloadMedia).not.toHaveBeenCalled();
+      } finally {
+        if (origMax === undefined) delete process.env.MEDIA_DOWNLOAD_MAX_BYTES;
+        else process.env.MEDIA_DOWNLOAD_MAX_BYTES = origMax;
+      }
     });
 
     it('stops the read loop when the abort signal fires (client disconnect)', async () => {
@@ -1225,7 +1304,17 @@ describe('WhatsAppWebJsAdapter channels (#625 — wwebjs Client has no getChanne
 
     expect(getChannels).toHaveBeenCalled();
     expect(fetchMessages).toHaveBeenCalledWith({ limit: 10 });
-    expect(result).toEqual([{ id: 'M1', body: 'hello', timestamp: 1700000000, hasMedia: false, mediaUrl: undefined }]);
+    expect(result).toEqual([{ id: 'M1', body: 'hello', timestamp: 1700000000, hasMedia: false }]);
+  });
+
+  it('getChannelMessages finds a channel whose id carries only the renamed `$1` field, as getChannelById does', async () => {
+    const fetchMessages = jest.fn().mockResolvedValue([]);
+    const getChannels = jest.fn().mockResolvedValue([{ id: { $1: CHANNEL }, name: 'News', fetchMessages }]);
+    const adapter = readyAdapter({ getChannels });
+
+    await expect(adapter.getChannelById(CHANNEL)).resolves.toMatchObject({ id: CHANNEL });
+    await expect(adapter.getChannelMessages(CHANNEL, 10)).resolves.toEqual([]);
+    expect(fetchMessages).toHaveBeenCalledWith({ limit: 10 });
   });
 
   it('getChannelMessages surfaces a not-found channel as ChannelNotFoundError (→ 404), not a silent []', async () => {
@@ -1245,13 +1334,19 @@ describe('WhatsAppWebJsAdapter channels (#625 — wwebjs Client has no getChanne
   });
 
   it('getChannelById resolves from the subscribed-channel list (no getChannelById call)', async () => {
-    const getChannels = jest
-      .fn()
-      .mockResolvedValue([
-        { id: { _serialized: CHANNEL }, name: 'News', description: 'desc', subscriberCount: 5, verified: true },
-      ]);
+    // The shape Client.getChannels() returns: Channel._patch copies these fields and keeps the newsletter metadata
+    // only under channelMetadata, which the mapping does not read, so no invite code, count or badge is filled.
+    const getChannels = jest.fn().mockResolvedValue([
+      {
+        id: { _serialized: CHANNEL },
+        name: 'News',
+        description: 'desc',
+        isChannel: true,
+        channelMetadata: { description: 'desc', createdAtTs: 1717200000 },
+      },
+    ]);
     const ch = await readyAdapter({ getChannels }).getChannelById(CHANNEL);
-    expect(ch).toMatchObject({ id: CHANNEL, name: 'News', description: 'desc', subscriberCount: 5, verified: true });
+    expect(ch).toEqual({ id: CHANNEL, name: 'News', description: 'desc' });
   });
 
   it('getChannelById returns null for a channel not in the subscribed list (service maps null → 404)', async () => {
@@ -1399,12 +1494,48 @@ describe('WhatsAppWebJsAdapter channel-JID guard (#554 — wwebjs Channel lacks 
     // WA Web yields no code when the account is not an admin of the group. String(undefined)
     // turned that into the literal 'undefined', which the controller rendered as the link
     // "https://chat.whatsapp.com/undefined" and returned with a 200.
-    it.each([
-      ['getGroupInviteCode', 'getInviteCode', (a: WhatsAppWebJsAdapter) => a.getGroupInviteCode('g@g.us')],
-      ['revokeGroupInviteCode', 'revokeInvite', (a: WhatsAppWebJsAdapter) => a.revokeGroupInviteCode('g@g.us')],
-    ])('%s treats a missing code as a refusal, not the string "undefined"', async (_name, method, call) => {
-      const stub = jest.fn().mockResolvedValue(undefined);
-      await expect(call(readyAdapter(groupChat({ [method]: stub })))).rejects.toBeInstanceOf(EngineRefusedError);
+    it('getGroupInviteCode treats a missing code as a refusal, not the string "undefined"', async () => {
+      const getInviteCode = jest.fn().mockResolvedValue(undefined);
+      await expect(readyAdapter(groupChat({ getInviteCode })).getGroupInviteCode('g@g.us')).rejects.toBeInstanceOf(
+        EngineRefusedError,
+      );
+    });
+
+    describe('revokeGroupInviteCode', () => {
+      const globals = globalThis as unknown as { window?: unknown };
+      afterEach(() => delete globals.window);
+
+      // Runs the in-page function in Node against a stubbed WA Web module registry, the way the page would.
+      const revokeWith = (resetGroupInviteCode: jest.Mock): Promise<string> => {
+        globals.window = {
+          require: (m: string) =>
+            m === 'WAWebWidFactory' ? { createWid: (id: string) => ({ id }) } : { resetGroupInviteCode },
+        };
+        const evaluate = jest.fn(<T, A>(fn: (arg: A) => Promise<T>, arg: A) => fn(arg));
+        // What upstream's GroupChat.revokeInvite hands back for a refusal: the page error, its name lost.
+        const revokeInvite = jest.fn().mockRejectedValue(new Error('Evaluation failed: ServerStatusCodeError'));
+        return readyAdapter({ ...groupChat({ revokeInvite }), pupPage: { evaluate } }).revokeGroupInviteCode('g@g.us');
+      };
+
+      it('returns the new code', async () => {
+        await expect(revokeWith(jest.fn().mockResolvedValue({ code: 'NEW123' }))).resolves.toBe('NEW123');
+      });
+
+      // A non-admin revoke is refused by WA Web with ServerStatusCodeError, which used to reach the
+      // caller as a raw 500 while the route declares 403.
+      it('answers a non-admin refusal with EngineRefusedError (403)', async () => {
+        const refusal = Object.assign(new Error('403'), { name: 'ServerStatusCodeError' });
+        await expect(revokeWith(jest.fn().mockRejectedValue(refusal))).rejects.toBeInstanceOf(EngineRefusedError);
+      });
+
+      it('treats a missing code as a refusal, not the string "undefined"', async () => {
+        await expect(revokeWith(jest.fn().mockResolvedValue(undefined))).rejects.toBeInstanceOf(EngineRefusedError);
+      });
+
+      it('keeps any other page failure unchanged', async () => {
+        const failure = new TypeError('resetGroupInviteCode is not a function');
+        await expect(revokeWith(jest.fn().mockRejectedValue(failure))).rejects.toBe(failure);
+      });
     });
   });
 
@@ -1697,7 +1828,7 @@ describe('WhatsAppWebJsAdapter credential-teardown observation', () => {
     const onCredentialTeardownStarted = jest.fn();
     (adapter as unknown as { client: unknown }).client = client;
     (adapter as unknown as { callbacks: unknown }).callbacks = { onCredentialTeardownStarted };
-    (adapter as unknown as { setupEventHandlers: () => void }).setupEventHandlers();
+    (adapter as unknown as { lifecycle: WwebjsLifecycle }).lifecycle.setupEventHandlers();
     return { client, onCredentialTeardownStarted };
   };
 
@@ -1897,7 +2028,7 @@ describe('WhatsAppWebJsAdapter credential-teardown observation', () => {
       onDisconnected,
       onStateChanged,
     };
-    (adapter as unknown as { setupEventHandlers: () => void }).setupEventHandlers();
+    (adapter as unknown as { lifecycle: WwebjsLifecycle }).lifecycle.setupEventHandlers();
     (adapter as unknown as { tearingDown: boolean }).tearingDown = true;
 
     client.emit('disconnected', 'LOGOUT');
@@ -1937,7 +2068,7 @@ describe('WhatsAppWebJsAdapter ready reconciliation (#251/#273)', () => {
 
     (adapter as unknown as { client: unknown }).client = client;
     (adapter as unknown as { callbacks: unknown }).callbacks = { onReady, onStateChanged };
-    (adapter as unknown as { setupEventHandlers: () => void }).setupEventHandlers();
+    (adapter as unknown as { lifecycle: WwebjsLifecycle }).lifecycle.setupEventHandlers();
 
     return { client, onReady, onStateChanged };
   };
@@ -2048,9 +2179,10 @@ describe('WhatsAppWebJsAdapter ready reconciliation (#251/#273)', () => {
     expect(jest.getTimerCount()).toBe(0);
   });
 
-  // whatsapp-web.js sets `eventsAttached = false` in its constructor (Client.js:109) and flips it only
-  // after attachEventListeners() resolves (Client.js:373). Everything in between — LoadUtils, a poll of
-  // up to 30s for window.WWebJS (Client.js:334), ClientInfo, InterfaceController — is a legitimately
+  // whatsapp-web.js sets `eventsAttached = false` in its constructor (and, with the ready-sync patch, whenever its
+  // post-auth callback starts attaching for a page without the helpers) and flips it only after
+  // attachEventListeners() resolves. Everything in between — LoadUtils, a poll of
+  // up to 30s for window.WWebJS, ClientInfo, InterfaceController — is a legitimately
   // slow attach, not a dead bridge. Reloading inside that window navigates the page out from under the
   // in-flight inject(): the re-inject then dies at getWWebVersion before it re-exposes any of the
   // bridge, and the one-shot guard blocks a retry, so the session is doomed to the deadline (#1081).
@@ -2099,7 +2231,7 @@ describe('WhatsAppWebJsAdapter ready reconciliation (#251/#273)', () => {
 
     expect(reload).toHaveBeenCalledTimes(1);
 
-    // Upstream's window.WWebJS poll alone is 30s (Client.js:334) and is only one stage of the attach.
+    // Upstream's window.WWebJS poll alone is 30s and is only one stage of the attach.
     // The grace has to outlast it, or we go back to aborting healthy attaches; and what remains before
     // the deadline has to outlast it too, or a warranted reload could never finish reinjecting.
     const UPSTREAM_WWEBJS_POLL_MS = 30_000;
@@ -2467,6 +2599,134 @@ describe('WhatsAppWebJsAdapter ready reconciliation (#251/#273)', () => {
     expect(onQRCode).toHaveBeenCalledTimes(1);
   });
 
+  it.each([EngineStatus.AUTHENTICATING, EngineStatus.READY, EngineStatus.ACTION_REQUIRED])(
+    'ignores a QR event while the session is %s',
+    async status => {
+      jest.useFakeTimers();
+      const encode = qrcode.toDataURL as unknown as jest.Mock;
+      encode.mockClear();
+      const adapter = newAdapter();
+      const { client, onStateChanged } = attachFakeClient(adapter);
+      const onQRCode = jest.fn();
+      (adapter as unknown as { callbacks: { onQRCode: jest.Mock } }).callbacks.onQRCode = onQRCode;
+      client.emit('authenticated');
+      if (status === EngineStatus.READY) client.emit('ready');
+      if (status === EngineStatus.ACTION_REQUIRED) {
+        (adapter as unknown as { lifecycle: { setStatus: (status: EngineStatus) => void } }).lifecycle.setStatus(
+          status,
+        );
+      }
+      onStateChanged.mockClear();
+
+      client.emit('qr', '2@buffered');
+      await Promise.resolve();
+
+      expect(encode).not.toHaveBeenCalled();
+      expect(adapter.getStatus()).toBe(status);
+      expect(adapter.getQRCode()).toBeNull();
+      expect(onQRCode).not.toHaveBeenCalled();
+      expect(onStateChanged).not.toHaveBeenCalled();
+    },
+  );
+
+  it('publishes QR rotations while the session is awaiting linking', async () => {
+    (qrcode.toDataURL as unknown as jest.Mock)
+      .mockResolvedValueOnce('data:image/png;base64,FIRSTQR')
+      .mockResolvedValueOnce('data:image/png;base64,NEXTQR');
+    const adapter = newAdapter();
+    const { client } = attachFakeClient(adapter);
+    const onQRCode = jest.fn();
+    (adapter as unknown as { callbacks: { onQRCode: jest.Mock } }).callbacks.onQRCode = onQRCode;
+
+    client.emit('qr', '2@first');
+    await Promise.resolve();
+    expect(adapter.getQRCode()).toBe('data:image/png;base64,FIRSTQR');
+    client.emit('qr', '2@next');
+    await Promise.resolve();
+
+    expect(adapter.getStatus()).toBe(EngineStatus.QR_READY);
+    expect(adapter.getQRCode()).toBe('data:image/png;base64,NEXTQR');
+    expect(onQRCode.mock.calls).toEqual([['data:image/png;base64,FIRSTQR'], ['data:image/png;base64,NEXTQR']]);
+  });
+
+  it.each(['failed', 'replaced', 'teardown'])(
+    'drops a QR whose encode finishes after the client is %s',
+    async state => {
+      let finishEncode!: (value: string) => void;
+      (qrcode.toDataURL as unknown as jest.Mock).mockReturnValueOnce(
+        new Promise<string>(resolve => {
+          finishEncode = resolve;
+        }),
+      );
+      const adapter = newAdapter();
+      const { client, onStateChanged } = attachFakeClient(adapter);
+      const onQRCode = jest.fn();
+      (adapter as unknown as { callbacks: { onQRCode: jest.Mock } }).callbacks.onQRCode = onQRCode;
+      client.emit('qr', '2@rendering');
+      if (state === 'failed') {
+        (adapter as unknown as { lifecycle: { setStatus: (status: EngineStatus) => void } }).lifecycle.setStatus(
+          EngineStatus.FAILED,
+        );
+      } else if (state === 'replaced') {
+        attachFakeClient(adapter);
+        (adapter as unknown as { callbacks: { onQRCode: jest.Mock } }).callbacks.onQRCode = onQRCode;
+      } else {
+        client.destroy = jest.fn().mockResolvedValue(undefined);
+        await adapter.disconnect();
+      }
+      const status = adapter.getStatus();
+      onStateChanged.mockClear();
+
+      finishEncode('data:image/png;base64,LATEQR');
+      await Promise.resolve();
+
+      expect(adapter.getStatus()).toBe(status);
+      expect(adapter.getQRCode()).toBeNull();
+      expect(onQRCode).not.toHaveBeenCalled();
+      expect(onStateChanged).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([EngineStatus.AUTHENTICATING, EngineStatus.READY, EngineStatus.ACTION_REQUIRED])(
+    'drops a QR whose encode finishes after the session becomes %s',
+    async status => {
+      jest.useFakeTimers();
+      let finishEncode!: (value: string) => void;
+      (qrcode.toDataURL as unknown as jest.Mock).mockReturnValueOnce(
+        new Promise<string>(resolve => {
+          finishEncode = resolve;
+        }),
+      );
+      const adapter = newAdapter();
+      const { client, onReady, onStateChanged } = attachFakeClient(adapter, { eventsAttached: true });
+      const onQRCode = jest.fn();
+      (adapter as unknown as { callbacks: { onQRCode: jest.Mock } }).callbacks.onQRCode = onQRCode;
+
+      client.emit('qr', '2@rendering');
+      client.emit('authenticated');
+      if (status === EngineStatus.READY) client.emit('ready');
+      if (status === EngineStatus.ACTION_REQUIRED) {
+        (adapter as unknown as { lifecycle: { setStatus: (status: EngineStatus) => void } }).lifecycle.setStatus(
+          status,
+        );
+      }
+      expect(adapter.getStatus()).toBe(status);
+      onStateChanged.mockClear();
+      finishEncode('data:image/png;base64,LATEQR');
+      await Promise.resolve();
+
+      expect(adapter.getStatus()).toBe(status);
+      expect(adapter.getQRCode()).toBeNull();
+      expect(onQRCode).not.toHaveBeenCalled();
+      expect(onStateChanged).not.toHaveBeenCalled();
+      expect(onReady).toHaveBeenCalledTimes(status === EngineStatus.READY ? 1 : 0);
+      if (status === EngineStatus.READY) {
+        client.pupPage.evaluate.mockResolvedValue([]);
+        await expect(adapter.getChats()).resolves.toEqual([]);
+      }
+    },
+  );
+
   // The cached QR belongs to the page that produced it. A Chromium crash or tab close while the operator
   // is looking at the QR is the reachable vector: handlePuppeteerDeath fires at QR_READY, the session
   // keeps the engine registered across its reconnect backoff, and GET /qr kept answering 200 with a code
@@ -2477,7 +2737,7 @@ describe('WhatsAppWebJsAdapter ready reconciliation (#251/#273)', () => {
     const pupPage = Object.assign(new EventEmitter(), { evaluate: jest.fn().mockResolvedValue(true) });
     const { client } = attachFakeClient(adapter, { pupPage: pupPage as unknown as FakeClient['pupPage'] });
     // The death listeners are armed by runInitAttempt, not by setupEventHandlers.
-    (adapter as unknown as { attachPuppeteerLifecycleListeners: () => void }).attachPuppeteerLifecycleListeners();
+    (adapter as unknown as { lifecycle: WwebjsLifecycle }).lifecycle.attachPuppeteerLifecycleListeners();
     const qrDone = deferredVoid();
     (adapter as unknown as { callbacks: { onQRCode: jest.Mock } }).callbacks.onQRCode = jest.fn(() => qrDone.resolve());
 
@@ -2706,6 +2966,9 @@ describe('WhatsAppWebJsAdapter ready reconciliation (#251/#273)', () => {
   // an `.on` method, and the rest of its evaluate completes either way. The page read that settles
   // it is one line, so ready says it instead of staying quiet.
   it('warns at ready when the page carries no call hook', async () => {
+    // The probe only runs on a tree that carries the ready-sync patch; what the installed tree carries is not this
+    // test's concern.
+    const patches = jest.spyOn(patchStatus, 'unappliedPatches').mockReturnValue([]);
     const adapter = newAdapter();
     const logger = (adapter as unknown as { logger: { warn: jest.Mock } }).logger;
     const warnSpy = jest.spyOn(logger, 'warn').mockImplementation(() => undefined);
@@ -2731,6 +2994,7 @@ describe('WhatsAppWebJsAdapter ready reconciliation (#251/#273)', () => {
     expect(missing).toBeDefined();
     expect(missing?.[1]).toMatchObject({ sessionId: 'sess-1' });
     warnSpy.mockRestore();
+    patches.mockRestore();
   });
 
   it('stays quiet at ready when the call hook is installed', async () => {
@@ -2895,7 +3159,7 @@ describe('WhatsAppWebJsAdapter ready reconciliation (#251/#273)', () => {
       destroy: jest.fn().mockResolvedValue(undefined),
     } as never);
     (adapter as unknown as { lifecycle: { status: EngineStatus } }).lifecycle.status = EngineStatus.AUTHENTICATING;
-    (adapter as unknown as { attachPuppeteerLifecycleListeners: () => void }).attachPuppeteerLifecycleListeners();
+    (adapter as unknown as { lifecycle: WwebjsLifecycle }).lifecycle.attachPuppeteerLifecycleListeners();
     const onDisconnected = jest.fn();
     Object.assign((adapter as unknown as { callbacks: object }).callbacks, {
       onDisconnected,
@@ -3213,7 +3477,7 @@ describe('WhatsAppWebJsAdapter status methods', () => {
           timestamp: 1700000030,
           hasMedia: true,
           _data: { mimetype: 'image/png', size: 3 },
-          downloadMedia,
+          ...onPage(downloadMedia),
         },
       ],
     };
@@ -3438,7 +3702,7 @@ describe('WhatsAppWebJsAdapter inbound media (MEDIA_DOWNLOAD_ENABLED=false)', ()
     (adapter as unknown as { client: unknown }).client = client;
     const onMessage = jest.fn();
     (adapter as unknown as { callbacks: unknown }).callbacks = { onMessage };
-    (adapter as unknown as { setupEventHandlers: () => void }).setupEventHandlers();
+    (adapter as unknown as { lifecycle: WwebjsLifecycle }).lifecycle.setupEventHandlers();
 
     const mockMsg = {
       id: { _serialized: 'MEDIA_OFF_1' },
@@ -3484,7 +3748,7 @@ describe('WhatsAppWebJsAdapter inbound media (MEDIA_DOWNLOAD_ENABLED=false)', ()
     (adapter as unknown as { client: unknown }).client = client;
     const onMessage = jest.fn();
     (adapter as unknown as { callbacks: unknown }).callbacks = { onMessage };
-    (adapter as unknown as { setupEventHandlers: () => void }).setupEventHandlers();
+    (adapter as unknown as { lifecycle: WwebjsLifecycle }).lifecycle.setupEventHandlers();
 
     const mockMsg = {
       id: { _serialized: 'CALL_1' },
@@ -3526,7 +3790,7 @@ describe('WhatsAppWebJsAdapter inbound media (MEDIA_DOWNLOAD_ENABLED=false)', ()
     (adapter as unknown as { client: unknown }).client = client;
     const onMessageCreate = jest.fn();
     (adapter as unknown as { callbacks: unknown }).callbacks = { onMessageCreate };
-    (adapter as unknown as { setupEventHandlers: () => void }).setupEventHandlers();
+    (adapter as unknown as { lifecycle: WwebjsLifecycle }).lifecycle.setupEventHandlers();
 
     const mockMsg = {
       id: { _serialized: 'OWN_MEDIA_1' },
@@ -3538,7 +3802,7 @@ describe('WhatsAppWebJsAdapter inbound media (MEDIA_DOWNLOAD_ENABLED=false)', ()
       fromMe: true,
       hasMedia: true,
       _data: { mimetype: 'image/png', size: 3 },
-      downloadMedia: jest.fn().mockResolvedValue({ mimetype: 'image/png', data: 'QUJD', filename: 'a.png' }),
+      ...onPage(jest.fn().mockResolvedValue({ mimetype: 'image/png', data: 'QUJD', filename: 'a.png' })),
       getContact: jest.fn().mockResolvedValue(null),
       hasQuotedMsg: false,
     };
@@ -3558,6 +3822,48 @@ describe('WhatsAppWebJsAdapter inbound media (MEDIA_DOWNLOAD_ENABLED=false)', ()
     expect(msg.media?.omitted).toBeUndefined();
   });
 
+  it('logs an own-send echo whose base cannot be built instead of dropping it silently', async () => {
+    // The echo runs in an async function whose rejection holdWhileProcessing consumes, so an unreadable
+    // `to` (a WhatsApp Web build renaming the field) vanished without a log line or the unhandled-rejection
+    // metric. The incoming handler logs the same defect; the echo must too. It is not admitted either, since
+    // its chat is unknown, so there is no ticket to settle.
+    const adapter = new WhatsAppWebJsAdapter({
+      sessionId: 'sess-echo-unreadable',
+      sessionDataPath: './data/sessions',
+      puppeteer: {},
+    });
+    const logger = (adapter as unknown as { logger: { error: jest.Mock } }).logger;
+    const errorSpy = jest.spyOn(logger, 'error').mockImplementation(() => undefined);
+    const client = Object.assign(new EventEmitter(), {
+      info: { wid: { user: '628123' }, pushname: 'Tester' },
+      getState: jest.fn().mockResolvedValue(WAState.CONNECTED),
+      pupPage: { evaluate: jest.fn().mockResolvedValue(true) },
+    });
+    (adapter as unknown as { client: unknown }).client = client;
+    const onMessageCreate = jest.fn();
+    const admitInbound = jest.fn();
+    (adapter as unknown as { callbacks: unknown }).callbacks = { onMessageCreate, admitInbound };
+    (adapter as unknown as { lifecycle: WwebjsLifecycle }).lifecycle.setupEventHandlers();
+
+    client.emit('message_create', {
+      id: { _serialized: 'OWN_UNREADABLE_1' },
+      from: '628123@c.us',
+      to: undefined,
+      body: '',
+      type: 'chat',
+      timestamp: 1700000074,
+      fromMe: true,
+      hasMedia: false,
+      hasQuotedMsg: false,
+    });
+    await new Promise(r => setImmediate(r));
+    await new Promise(r => setImmediate(r));
+
+    expect(onMessageCreate).not.toHaveBeenCalled();
+    expect(admitInbound).not.toHaveBeenCalled();
+    expect(errorSpy).toHaveBeenCalledWith('Error processing outgoing message', expect.stringContaining('endsWith'));
+  });
+
   it('does not download the media of an own status post echo', async () => {
     // The echo consumer drops status posts, so the blob was fetched in full, held an inbound limiter
     // slot, and was thrown away.
@@ -3575,7 +3881,7 @@ describe('WhatsAppWebJsAdapter inbound media (MEDIA_DOWNLOAD_ENABLED=false)', ()
     (adapter as unknown as { client: unknown }).client = client;
     const onMessageCreate = jest.fn();
     (adapter as unknown as { callbacks: unknown }).callbacks = { onMessageCreate };
-    (adapter as unknown as { setupEventHandlers: () => void }).setupEventHandlers();
+    (adapter as unknown as { lifecycle: WwebjsLifecycle }).lifecycle.setupEventHandlers();
 
     const mockMsg = {
       id: { _serialized: 'OWN_STATUS_1' },
@@ -3587,7 +3893,7 @@ describe('WhatsAppWebJsAdapter inbound media (MEDIA_DOWNLOAD_ENABLED=false)', ()
       fromMe: true,
       hasMedia: true,
       _data: { mimetype: 'image/png', size: 3 },
-      downloadMedia: jest.fn().mockResolvedValue({ mimetype: 'image/png', data: 'QUJD', filename: 'a.png' }),
+      ...onPage(jest.fn().mockResolvedValue({ mimetype: 'image/png', data: 'QUJD', filename: 'a.png' })),
       hasQuotedMsg: false,
     };
 
@@ -3619,7 +3925,7 @@ describe('WhatsAppWebJsAdapter inbound media (MEDIA_DOWNLOAD_ENABLED=false)', ()
     (adapter as unknown as { client: unknown }).client = client;
     const onMessageCreate = jest.fn();
     (adapter as unknown as { callbacks: unknown }).callbacks = { onMessageCreate };
-    (adapter as unknown as { setupEventHandlers: () => void }).setupEventHandlers();
+    (adapter as unknown as { lifecycle: WwebjsLifecycle }).lifecycle.setupEventHandlers();
 
     const mockMsg = {
       id: { _serialized: 'OWN_MEDIA_2' },
@@ -3631,7 +3937,7 @@ describe('WhatsAppWebJsAdapter inbound media (MEDIA_DOWNLOAD_ENABLED=false)', ()
       fromMe: true,
       hasMedia: true,
       _data: { mimetype: 'image/png', size: 3 },
-      downloadMedia: jest.fn().mockRejectedValue(new Error('media gone')),
+      ...onPage(jest.fn().mockRejectedValue(new Error('media gone'))),
       getContact: jest.fn().mockResolvedValue(null),
       hasQuotedMsg: false,
     };
@@ -3667,7 +3973,7 @@ describe('WhatsAppWebJsAdapter inbound media (MEDIA_DOWNLOAD_ENABLED=false)', ()
     (adapter as unknown as { client: unknown }).client = client;
     const onMessage = jest.fn();
     (adapter as unknown as { callbacks: unknown }).callbacks = { onMessage };
-    (adapter as unknown as { setupEventHandlers: () => void }).setupEventHandlers();
+    (adapter as unknown as { lifecycle: WwebjsLifecycle }).lifecycle.setupEventHandlers();
 
     const mockMsg = {
       id: { _serialized: 'IN_MEDIA_FAIL_1' },
@@ -3680,7 +3986,7 @@ describe('WhatsAppWebJsAdapter inbound media (MEDIA_DOWNLOAD_ENABLED=false)', ()
       hasMedia: true,
       _data: { mimetype: 'image/jpeg', size: 2048 },
       // The minified page-side throw a WhatsApp Web build surfaces through Puppeteer.
-      downloadMedia: jest.fn().mockRejectedValue(new Error('t: t')),
+      ...onPage(jest.fn().mockRejectedValue(new Error('t: t'))),
       getContact: jest.fn().mockResolvedValue(null),
       hasQuotedMsg: false,
     };
@@ -3695,6 +4001,116 @@ describe('WhatsAppWebJsAdapter inbound media (MEDIA_DOWNLOAD_ENABLED=false)', ()
     expect(msg.type).toBe('image');
     expect(msg.media).toEqual({ mimetype: 'image/jpeg', omitted: true, sizeBytes: 2048 });
     expect(mockMsg.downloadMedia).toHaveBeenCalled(); // the disabled exit builds the same marker
+  });
+});
+
+describe('WhatsAppWebJsAdapter vote_update (poll.vote)', () => {
+  const wireVoteHandler = (): { onPollVote: jest.Mock; client: EventEmitter } => {
+    const adapter = new WhatsAppWebJsAdapter({
+      sessionId: 'sess-vote-test',
+      sessionDataPath: './data/sessions',
+      puppeteer: {},
+    });
+    const client = Object.assign(new EventEmitter(), {
+      info: { wid: { _serialized: 'me@c.us', user: '628123' }, pushname: 'Tester' },
+      getState: jest.fn().mockResolvedValue(WAState.CONNECTED),
+      pupPage: { evaluate: jest.fn().mockResolvedValue(true) },
+    });
+    (adapter as unknown as { client: unknown }).client = client;
+    const onPollVote = jest.fn();
+    (adapter as unknown as { callbacks: unknown }).callbacks = { onPollVote };
+    (adapter as unknown as { lifecycle: WwebjsLifecycle }).lifecycle.setupEventHandlers();
+    return { onPollVote, client };
+  };
+
+  // The shape `PollVote` builds: `voter` and `parentMsgKey` are raw page-context Wids, and
+  // `parentMessage` a Message built from the poll creation message (or from nothing).
+  const ownPoll = {
+    id: { _serialized: 'true_peer@c.us_POLL1' },
+    from: 'me@c.us',
+    to: 'peer@c.us',
+    fromMe: true,
+    pollName: 'Did you finish the report?',
+  };
+  const vote = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+    voter: { _serialized: 'peer@c.us' },
+    selectedOptions: [{ name: 'Done', localId: 0 }],
+    interractedAtTs: 1786000000123,
+    parentMessage: ownPoll,
+    parentMsgKey: { _serialized: 'true_peer@c.us_POLL1', remote: { _serialized: 'peer@c.us' } },
+    ...overrides,
+  });
+
+  it('maps a vote on a poll the account sent to the neutral event', () => {
+    const { onPollVote, client } = wireVoteHandler();
+
+    client.emit('vote_update', vote());
+
+    expect(onPollVote).toHaveBeenCalledWith({
+      pollMessageId: 'true_peer@c.us_POLL1',
+      chatId: 'peer@c.us',
+      voterId: 'peer@c.us',
+      selectedOptions: ['Done'],
+      pollName: 'Did you finish the report?',
+      timestamp: 1786000000,
+      timestampMs: 1786000000123,
+    });
+  });
+
+  it('takes the chat from the sender of a poll the account received in a group', () => {
+    const { onPollVote, client } = wireVoteHandler();
+    const groupPoll = { ...ownPoll, from: '120363000000000001@g.us', to: 'me@c.us', fromMe: false };
+
+    client.emit('vote_update', vote({ parentMessage: groupPoll, voter: { _serialized: 'member@lid' } }));
+
+    expect(onPollVote).toHaveBeenCalledWith(
+      expect.objectContaining({ chatId: '120363000000000001@g.us', voterId: 'member@lid' }),
+    );
+  });
+
+  it('reports a cleared vote as an empty selection', () => {
+    const { onPollVote, client } = wireVoteHandler();
+
+    client.emit('vote_update', vote({ selectedOptions: [] }));
+
+    expect(onPollVote).toHaveBeenCalledWith(expect.objectContaining({ selectedOptions: [] }));
+  });
+
+  it('falls back to the poll key for a cleared vote when WhatsApp Web no longer holds the poll', () => {
+    const { onPollVote, client } = wireVoteHandler();
+
+    // Without the creation message, PollVote builds an empty Message from the poll key alone.
+    client.emit('vote_update', vote({ parentMessage: {}, selectedOptions: [], voter: { $1: 'peer@c.us' } }));
+
+    const event = (onPollVote.mock.calls as Array<[Record<string, unknown>]>)[0][0];
+    expect(event).toEqual({
+      pollMessageId: 'true_peer@c.us_POLL1',
+      chatId: 'peer@c.us',
+      voterId: 'peer@c.us',
+      selectedOptions: [],
+      timestamp: 1786000000,
+      timestampMs: 1786000000123,
+    });
+    expect(event).not.toHaveProperty('pollName');
+  });
+
+  it('skips a vote whose options WhatsApp Web cannot name, rather than reporting it as a cleared vote', () => {
+    const { onPollVote, client } = wireVoteHandler();
+
+    // Without the creation message PollVote keeps only local option ids, so the choice is unknown.
+    client.emit(
+      'vote_update',
+      vote({ parentMessage: {}, selectedOptions: [{ name: undefined, localId: 1 }], voter: { $1: 'peer@c.us' } }),
+    );
+
+    expect(onPollVote).not.toHaveBeenCalled();
+  });
+
+  it('logs and drops a malformed vote instead of throwing into the client', () => {
+    const { onPollVote, client } = wireVoteHandler();
+
+    expect(() => client.emit('vote_update', null)).not.toThrow();
+    expect(onPollVote).not.toHaveBeenCalled();
   });
 });
 
@@ -3713,7 +4129,7 @@ describe('WhatsAppWebJsAdapter message_reaction (id resolution across WA Web bui
     (adapter as unknown as { client: unknown }).client = client;
     const onMessageReaction = jest.fn();
     (adapter as unknown as { callbacks: unknown }).callbacks = { onMessageReaction };
-    (adapter as unknown as { setupEventHandlers: () => void }).setupEventHandlers();
+    (adapter as unknown as { lifecycle: WwebjsLifecycle }).lifecycle.setupEventHandlers();
     return { onMessageReaction, client };
   };
 
@@ -3722,10 +4138,10 @@ describe('WhatsAppWebJsAdapter message_reaction (id resolution across WA Web bui
     return calls[0][0];
   };
 
-  const emitReaction = (client: EventEmitter, msgId: unknown): void => {
+  const emitReaction = (client: EventEmitter, msgId: unknown, key: object = { remote: 'peer@c.us' }): void => {
     client.emit('message_reaction', {
       msgId,
-      id: { remote: 'peer@c.us' },
+      id: key,
       reaction: '👍',
       senderId: 'peer@c.us',
     });
@@ -3758,6 +4174,31 @@ describe('WhatsAppWebJsAdapter message_reaction (id resolution across WA Web bui
     // condition from the where-clause — which would match an unrelated row.
     expect(reactionArg(onMessageReaction).messageId).toBe('');
   });
+
+  // The reaction's key crosses the page boundary as JSON, so a chat id WhatsApp Web keeps as a Wid object arrives
+  // as an object; downstream compares chatId as a string and publishes it in the message.reaction payload.
+  it.each([
+    ['a string', 'peer@c.us'],
+    ['an object with _serialized', { _serialized: 'peer@c.us', user: 'peer', server: 'c.us' }],
+    ['an object on a build that renamed _serialized (#747)', { $1: 'peer@c.us' }],
+  ])('reads the chat id of a reaction whose remote arrives as %s', (_how, remote) => {
+    const { onMessageReaction, client } = wireReactionHandler();
+
+    emitReaction(client, { _serialized: 'REACTED_MSG' }, { remote });
+
+    expect(reactionArg(onMessageReaction).chatId).toBe('peer@c.us');
+  });
+
+  it.each([
+    ['missing', {}],
+    ['an object with no readable id', { remote: {} }],
+  ])('emits the empty chat id, never undefined or an object, when the remote is %s', (_how, key) => {
+    const { onMessageReaction, client } = wireReactionHandler();
+
+    emitReaction(client, { _serialized: 'REACTED_MSG' }, key);
+
+    expect(reactionArg(onMessageReaction).chatId).toBe('');
+  });
 });
 
 describe('WhatsAppWebJsAdapter message_revoke_everyone (forwards the original deleted id as revokedId)', () => {
@@ -3775,7 +4216,7 @@ describe('WhatsAppWebJsAdapter message_revoke_everyone (forwards the original de
     (adapter as unknown as { client: unknown }).client = client;
     const onMessageRevoked = jest.fn();
     (adapter as unknown as { callbacks: unknown }).callbacks = { onMessageRevoked };
-    (adapter as unknown as { setupEventHandlers: () => void }).setupEventHandlers();
+    (adapter as unknown as { lifecycle: WwebjsLifecycle }).lifecycle.setupEventHandlers();
     return { onMessageRevoked, client };
   };
 
@@ -3854,9 +4295,33 @@ describe('WhatsAppWebJsAdapter message_edit', () => {
     (adapter as unknown as { client: unknown }).client = client;
     const onMessageEdited = jest.fn();
     (adapter as unknown as { callbacks: unknown }).callbacks = { onMessageEdited };
-    (adapter as unknown as { setupEventHandlers: () => void }).setupEventHandlers();
+    (adapter as unknown as { lifecycle: WwebjsLifecycle }).lifecycle.setupEventHandlers();
     return { onMessageEdited, client };
   };
+
+  // The client emits `new Message(client, model)` with the model serialized inside WhatsApp Web's change:body or
+  // change:caption handler, so it holds the values after the change (Client.js, onEditMessageEvent). Built here
+  // with the real structure, whose `body` is the caption of a message with a file and the body attribute otherwise.
+  const WwebjsMessage = jest.requireActual<{ Message: new (client: unknown, data: object) => unknown }>(
+    'whatsapp-web.js',
+  ).Message;
+  const changed = (client: EventEmitter, model: Record<string, unknown>, newBody: unknown, prevBody: unknown): void => {
+    client.emit(
+      'message_edit',
+      new WwebjsMessage(client, {
+        id: { id: 'EDIT1', remote: 'peer@c.us', fromMe: false, _serialized: 'false_peer@c.us_EDIT1' },
+        from: 'peer@c.us',
+        to: 'me@c.us',
+        t: 1700000080,
+        ...model,
+      }),
+      newBody,
+      prevBody,
+    );
+  };
+  const editedBodies = (onMessageEdited: jest.Mock): string[] =>
+    (onMessageEdited.mock.calls as Array<[EditedMessage]>).map(([edit]) => edit.body);
+  const THUMB = '/9j/4AAQSkZJRgABAQAAAQABAAD';
 
   it('emits onMessageEdited with the new body and mapped fields', () => {
     const { onMessageEdited, client } = wireEditHandler();
@@ -3865,18 +4330,16 @@ describe('WhatsAppWebJsAdapter message_edit', () => {
     try {
       client.emit(
         'message_edit',
-        {
-          id: { _serialized: 'MSG_EDIT_1' },
+        new WwebjsMessage(client, {
+          id: { id: 'MSG_EDIT_1', remote: 'peer@c.us', fromMe: false, _serialized: 'MSG_EDIT_1' },
           from: 'peer@c.us',
           to: 'me@c.us',
           author: 'peer@c.us',
-          body: 'Old text',
+          body: 'Edited new text',
           type: 'chat',
-          fromMe: false,
-          hasMedia: false,
-          mentionedIds: ['mentioned@c.us'],
-          timestamp: 1700000080,
-        },
+          mentionedJidList: ['mentioned@c.us'],
+          t: 1700000080,
+        }),
         'Edited new text',
         'Old text',
       );
@@ -3902,6 +4365,56 @@ describe('WhatsAppWebJsAdapter message_edit', () => {
       timestamp: 1700000089,
     });
   });
+
+  it('emits the new caption of a media message whose caption changed', () => {
+    const { onMessageEdited, client } = wireEditHandler();
+    changed(
+      client,
+      { type: 'image', body: THUMB, caption: 'new caption', directPath: '/v/t62/1', mimetype: 'image/jpeg' },
+      'new caption',
+      'old caption',
+    );
+
+    expect(editedBodies(onMessageEdited)).toEqual(['new caption']);
+    const [[edit]] = onMessageEdited.mock.calls as Array<[EditedMessage]>;
+    expect(edit).toEqual(expect.objectContaining({ type: 'image', hasMedia: true }));
+  });
+
+  it.each([
+    ['the thumbnail of a captioned image', { type: 'image', caption: 'cap', directPath: '/v/t62/1' }],
+    [
+      'the thumbnail of a forwarded video',
+      { type: 'video', caption: 'cap', directPath: '/v/t62/2', isForwarded: true },
+    ],
+    ['the thumbnail of an image without a caption', { type: 'image', directPath: '/v/t62/3' }],
+  ])('emits nothing when only %s changed', (_what, model) => {
+    const { onMessageEdited, client } = wireEditHandler();
+    changed(client, { ...model, body: `${THUMB}new` }, `${THUMB}new`, `${THUMB}old`);
+
+    expect(onMessageEdited).not.toHaveBeenCalled();
+  });
+
+  it('emits nothing for a changed location preview, which no user edits', () => {
+    const { onMessageEdited, client } = wireEditHandler();
+    changed(client, { type: 'location', body: `${THUMB}new`, lat: 1, lng: 2 }, `${THUMB}new`, `${THUMB}old`);
+
+    expect(onMessageEdited).not.toHaveBeenCalled();
+  });
+
+  it('emits nothing for a changed caption attribute of a text message, which shows its body', () => {
+    const { onMessageEdited, client } = wireEditHandler();
+    changed(client, { type: 'chat', body: 'hello', caption: 'stray' }, 'stray', undefined);
+
+    expect(onMessageEdited).not.toHaveBeenCalled();
+  });
+
+  it('emits nothing for a media message WhatsApp Web holds no file for, whose body attribute is its thumbnail', () => {
+    const { onMessageEdited, client } = wireEditHandler();
+    changed(client, { type: 'image', body: `${THUMB}new`, caption: 'cap' }, `${THUMB}new`, `${THUMB}old`);
+    changed(client, { type: 'image', body: THUMB, caption: 'new caption' }, 'new caption', 'cap');
+
+    expect(onMessageEdited).not.toHaveBeenCalled();
+  });
 });
 
 describe('WhatsAppWebJsAdapter group notifications (group_join / group_leave / group_update)', () => {
@@ -3919,7 +4432,7 @@ describe('WhatsAppWebJsAdapter group notifications (group_join / group_leave / g
     (adapter as unknown as { client: unknown }).client = client;
     const onGroupEvent = jest.fn();
     (adapter as unknown as { callbacks: unknown }).callbacks = { onGroupEvent };
-    (adapter as unknown as { setupEventHandlers: () => void }).setupEventHandlers();
+    (adapter as unknown as { lifecycle: WwebjsLifecycle }).lifecycle.setupEventHandlers();
     return { onGroupEvent, client };
   };
 
@@ -4221,7 +4734,7 @@ describe('WhatsAppWebJsAdapter call event + rejectCall', () => {
     (adapter as unknown as { client: unknown }).client = client;
     const onCall = jest.fn();
     (adapter as unknown as { callbacks: unknown }).callbacks = { onCall };
-    (adapter as unknown as { setupEventHandlers: () => void }).setupEventHandlers();
+    (adapter as unknown as { lifecycle: WwebjsLifecycle }).lifecycle.setupEventHandlers();
     return { adapter, onCall, client };
   };
 
@@ -4364,7 +4877,7 @@ describe('WhatsAppWebJsAdapter call event + rejectCall', () => {
   it('teardown clears the ringing call cache', async () => {
     const { adapter, client } = wireCallHandler();
     client.emit('call', liveCall());
-    const cache = (adapter as unknown as { liveCalls: Map<string, number> }).liveCalls;
+    const cache = (adapter as unknown as { calls: WwebjsCalls }).calls.liveCalls;
     expect(cache.has('CALL1')).toBe(true);
 
     await adapter.disconnect();
@@ -4683,17 +5196,14 @@ describe('outbound document mode (#989)', () => {
       (undiciFetch as jest.Mock).mockResolvedValue(remoteResponse({ 'content-type': 'application/octet-stream' }));
       const sendMessage = jest.fn().mockResolvedValue(sentMessage);
 
-      await ready({ sendMessage }).sendStickerMessage('628@c.us', {
-        mimetype: declaredMimetype,
-        data: 'https://files.example.com/sticker-source',
-      });
-
-      // The placeholder sticks — exactly what the DTO would have produced before this change.
-      expect(sendMessage).toHaveBeenCalledWith(
-        '628@c.us',
-        expect.objectContaining({ mimetype: 'application/octet-stream' }),
-        expect.objectContaining({ sendMediaAsSticker: true }),
-      );
+      // The placeholder sticks, and whatsapp-web.js cannot convert it, so the send is refused before it.
+      await expect(
+        ready({ sendMessage }).sendStickerMessage('628@c.us', {
+          mimetype: declaredMimetype,
+          data: 'https://files.example.com/sticker-source',
+        }),
+      ).rejects.toThrow("Received 'application/octet-stream'");
+      expect(sendMessage).not.toHaveBeenCalled();
     });
 
     // The document/image normal path (trustDeclaredType is undefined, not false) is unchanged by the
@@ -4798,6 +5308,29 @@ describe('outbound document mode (#989)', () => {
       expect(sendMessage).toHaveBeenCalledWith(
         '628@c.us',
         expect.objectContaining({ mimetype: 'video/webm' }),
+        expect.anything(),
+      );
+    });
+
+    // Status media takes the same route default: a URL posted without a declared type keeps a specific
+    // fetched type, and a generic one would otherwise reach WA Web and turn a photo into a document.
+    it.each<['postImageStatus' | 'postVideoStatus' | 'postVoiceStatus', string, string]>([
+      ['postImageStatus', 'image/png', 'image/png'],
+      ['postImageStatus', 'application/octet-stream', 'image/jpeg'],
+      ['postVideoStatus', '', 'video/mp4'],
+      ['postVoiceStatus', 'binary/octet-stream', 'audio/ogg; codecs=opus'],
+    ])('%s from a URL served as %j goes out as %s', async (post, fetched, expected) => {
+      (undiciFetch as jest.Mock).mockResolvedValue(remoteResponse({ 'content-type': fetched }));
+      const sendMessage = jest.fn().mockResolvedValue(sentMessage);
+
+      await ready({ sendMessage })[post](
+        { mimetype: 'application/octet-stream', data: 'https://files.example.com/status' },
+        {},
+      );
+
+      expect(sendMessage).toHaveBeenCalledWith(
+        'status@broadcast',
+        expect.objectContaining({ mimetype: expected }),
         expect.anything(),
       );
     });
@@ -5139,6 +5672,51 @@ describe('votePoll', () => {
     const adapter = ready(chatWith([]));
     await expect(adapter.votePoll('628@c.us', 'OLD', ['x'])).rejects.toBeInstanceOf(MessageNotFoundError);
   });
+
+  describe('option texts checked against the poll', () => {
+    const poll = (vote: jest.Mock) => ({
+      id: { _serialized: 'P1' },
+      pollOptions: [
+        { name: 'Pizza', localId: 0 },
+        { name: 'Sushi', localId: 1 },
+      ],
+      vote,
+    });
+
+    it('refuses options that match none of the poll texts with 400, never sending the empty vote', async () => {
+      // vote() would send an empty selection here, which clears the account's vote, while the route
+      // answered 200 (the hidden defect behind #1738).
+      const vote = jest.fn().mockResolvedValue(undefined);
+      const adapter = ready(chatWith([poll(vote)]));
+
+      const err = await adapter.votePoll('628@c.us', 'P1', ['pizza', 'Burger']).catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(BadRequestException);
+      expect((err as BadRequestException).getResponse()).toEqual(
+        expect.objectContaining({ code: 'POLL_OPTION_NOT_FOUND', validOptions: ['Pizza', 'Sushi'] }),
+      );
+      expect((err as Error).message).toMatch(/"Pizza", "Sushi"/);
+      expect(vote).not.toHaveBeenCalled();
+    });
+
+    it('still votes when at least one text matches, as before', async () => {
+      const vote = jest.fn().mockResolvedValue(undefined);
+      const adapter = ready(chatWith([poll(vote)]));
+
+      await adapter.votePoll('628@c.us', 'P1', ['Pizza', 'Burger']);
+
+      expect(vote).toHaveBeenCalledWith(['Pizza', 'Burger']);
+    });
+
+    it('keeps an explicit empty array as a deliberate clear', async () => {
+      const vote = jest.fn().mockResolvedValue(undefined);
+      const adapter = ready(chatWith([poll(vote)]));
+
+      await adapter.votePoll('628@c.us', 'P1', []);
+
+      expect(vote).toHaveBeenCalledWith([]);
+    });
+  });
 });
 
 describe('pinMessage / unpinMessage', () => {
@@ -5274,6 +5852,50 @@ describe('LID mapping persistence to LidMappingStore (#583 R3)', () => {
       readyWithStore({ getNumberId, sendMessage }, makeStore(remember)).sendTextMessage('529934031058@c.us', 'hi'),
     ).resolves.toBeDefined();
   });
+
+  it.each(['resolves false', 'rejects'])(
+    'reports the pair again with the next send when the mapping write %s, without probing again',
+    async failure => {
+      const remember = jest.fn().mockResolvedValue(true);
+      if (failure === 'rejects') remember.mockRejectedValueOnce(new Error('db down'));
+      else remember.mockResolvedValueOnce(false);
+      const getNumberId = jest.fn().mockResolvedValue({ _serialized: '555000111@lid' });
+      const sendMessage = jest.fn<Promise<typeof sentMessage>, [string, ...unknown[]]>().mockResolvedValue(sentMessage);
+      const adapter = readyWithStore({ getNumberId, sendMessage }, makeStore(remember));
+
+      await adapter.sendTextMessage('628111@c.us', 'first');
+      await adapter.sendTextMessage('628111@c.us', 'second');
+      await adapter.sendTextMessage('628111@c.us', 'third');
+
+      expect(getNumberId).toHaveBeenCalledTimes(1);
+      expect(remember).toHaveBeenCalledTimes(2);
+      expect(remember).toHaveBeenNthCalledWith(2, '555000111', '628111', 's1');
+      expect(sendMessage.mock.calls.map(call => call[0])).toEqual(['555000111@lid', '555000111@lid', '555000111@lid']);
+    },
+  );
+
+  it('does not report a newer resolution again when an older mapping write fails late', async () => {
+    let settleOlder!: (stored: boolean) => void;
+    const getNumberId = jest
+      .fn()
+      .mockResolvedValueOnce({ _serialized: '555000111@lid' })
+      .mockResolvedValueOnce({ _serialized: '555000222@lid' });
+    const remember = jest
+      .fn()
+      .mockReturnValueOnce(new Promise<boolean>(resolve => (settleOlder = resolve)))
+      .mockResolvedValue(true);
+    const sendMessage = jest.fn<Promise<typeof sentMessage>, [string, ...unknown[]]>().mockResolvedValue(sentMessage);
+    const adapter = readyWithStore({ getNumberId, sendMessage }, makeStore(remember));
+
+    await Promise.all([adapter.sendTextMessage('628111@c.us', 'a'), adapter.sendTextMessage('628111@c.us', 'b')]);
+    settleOlder(false);
+    await new Promise(resolve => setImmediate(resolve));
+    await adapter.sendTextMessage('628111@c.us', 'c');
+
+    expect(getNumberId).toHaveBeenCalledTimes(2);
+    expect(remember).toHaveBeenCalledTimes(2);
+    expect(sendMessage.mock.calls[2][0]).toBe('555000222@lid');
+  });
 });
 
 describe('extractWwebjsCall (call_log → { video, missed }, salvaged from #494)', () => {
@@ -5355,15 +5977,17 @@ describe('WhatsAppWebJsAdapter inbound media concurrency (slot held until the re
     const makeMsg = (id: string): unknown => ({
       id: { _serialized: id },
       _data: { size: 100, mimetype: 'image/png' },
-      downloadMedia: jest.fn(() => {
-        inFlight++;
-        maxInFlight = Math.max(maxInFlight, inFlight);
-        const d = defer<{ mimetype: string; data: string }>();
-        downloads.push(d);
-        return d.promise.finally(() => {
-          inFlight--;
-        });
-      }),
+      ...onPage(
+        jest.fn(() => {
+          inFlight++;
+          maxInFlight = Math.max(maxInFlight, inFlight);
+          const d = defer<{ mimetype: string; data: string }>();
+          downloads.push(d);
+          return d.promise.finally(() => {
+            inFlight--;
+          });
+        }),
+      ),
     });
     const cap = (m: unknown): Promise<unknown> =>
       (adapter as unknown as { capInboundMediaFor: (msg: unknown) => Promise<unknown> }).capInboundMediaFor(m);
@@ -5408,13 +6032,15 @@ describe('WhatsAppWebJsAdapter inbound media concurrency (slot held until the re
     const makeMsg = (id: string): unknown => ({
       id: { _serialized: id },
       _data: { size: 100, mimetype: 'image/png' },
-      downloadMedia: jest.fn(() => {
-        started.push(id);
-        // Every download takes 60 ms, inside the 100 ms deadline on its own.
-        return new Promise(resolve =>
-          setTimeout(() => resolve({ mimetype: 'image/png', data: Buffer.from(id).toString('base64') }), 60),
-        );
-      }),
+      ...onPage(
+        jest.fn(() => {
+          started.push(id);
+          // Every download takes 60 ms, inside the 100 ms deadline on its own.
+          return new Promise(resolve =>
+            setTimeout(() => resolve({ mimetype: 'image/png', data: Buffer.from(id).toString('base64') }), 60),
+          );
+        }),
+      ),
     });
     const cap = (m: unknown): Promise<{ data?: string; omitted?: boolean }> =>
       (
@@ -5449,12 +6075,14 @@ describe('WhatsAppWebJsAdapter inbound media concurrency (slot held until the re
     const makeMsg = (id: string, behavior: 'reject' | 'resolve'): unknown => ({
       id: { _serialized: id },
       _data: { size: 100, mimetype: 'image/png' },
-      downloadMedia: jest.fn(() => {
-        calls.push(id);
-        return behavior === 'reject'
-          ? Promise.reject(new Error('download blew up'))
-          : Promise.resolve({ mimetype: 'image/png', data: Buffer.from('ok').toString('base64') });
-      }),
+      ...onPage(
+        jest.fn(() => {
+          calls.push(id);
+          return behavior === 'reject'
+            ? Promise.reject(new Error('download blew up'))
+            : Promise.resolve({ mimetype: 'image/png', data: Buffer.from('ok').toString('base64') });
+        }),
+      ),
     });
     const cap = (m: unknown): Promise<unknown> =>
       (adapter as unknown as { capInboundMediaFor: (msg: unknown) => Promise<unknown> }).capInboundMediaFor(m);
@@ -5469,6 +6097,379 @@ describe('WhatsAppWebJsAdapter inbound media concurrency (slot held until the re
     const media = (await cap(makeMsg('good', 'resolve'))) as { mimetype: string; data: string };
     expect(media.data).toBe(Buffer.from('ok').toString('base64'));
     expect(calls).toEqual(['bad', 'good']);
+  });
+
+  it('never lets a per-call override raise the cap above MEDIA_DOWNLOAD_MAX_BYTES', async () => {
+    process.env.MEDIA_DOWNLOAD_MAX_BYTES = '1000';
+    process.env.MEDIA_DOWNLOAD_ENABLED = 'true';
+
+    const adapter = newAdapter();
+    const downloadMedia = jest.fn(() => Promise.resolve({ mimetype: 'video/mp4', data: 'x'.repeat(2000) }));
+    const msg = { id: { _serialized: 'big' }, _data: { size: 1500, mimetype: 'video/mp4' }, ...onPage(downloadMedia) };
+    const cap = (m: unknown, override: number): Promise<unknown> =>
+      (adapter as unknown as { capInboundMediaFor: (msg: unknown, o: number) => Promise<unknown> }).capInboundMediaFor(
+        m,
+        override,
+      );
+
+    // The declared 1500 bytes is over the global 1000 cap, so the larger override must not admit it.
+    await expect(cap(msg, 5000)).resolves.toEqual(
+      expect.objectContaining({ mimetype: 'video/mp4', omitted: true, sizeBytes: 1500 }),
+    );
+    expect(downloadMedia).not.toHaveBeenCalled();
+  });
+
+  it('drops a downloaded payload over the per-call override when no size was declared', async () => {
+    process.env.MEDIA_DOWNLOAD_MAX_BYTES = '1000';
+    process.env.MEDIA_DOWNLOAD_ENABLED = 'true';
+
+    const adapter = newAdapter();
+    const data = Buffer.alloc(300).toString('base64');
+    const downloadMedia = jest.fn(() => Promise.resolve({ mimetype: 'image/jpeg', data }));
+    const msg = { id: { _serialized: 'undeclared' }, _data: {}, ...onPage(downloadMedia) };
+    const cap = (m: unknown, override: number): Promise<unknown> =>
+      (adapter as unknown as { capInboundMediaFor: (msg: unknown, o: number) => Promise<unknown> }).capInboundMediaFor(
+        m,
+        override,
+      );
+
+    // Nothing declared, so the pre-gate admits it; the real 300 bytes is under the global cap but over 100.
+    await expect(cap(msg, 100)).resolves.toEqual(
+      expect.objectContaining({ mimetype: 'image/jpeg', omitted: true, sizeBytes: 300 }),
+    );
+    expect(downloadMedia).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * The cap on what the page actually decrypted. The pre-gate only sees the size the sender declares,
+ * so a message that understates it passes; downloadMediaInPage runs here against a stand-in `window`
+ * whose download returns more than that.
+ */
+describe('WhatsAppWebJsAdapter inbound media measured in the page', () => {
+  const g = globalThis as unknown as { window?: unknown };
+  const ENV_KEYS = ['MEDIA_DOWNLOAD_MAX_BYTES', 'MEDIA_DOWNLOAD_ENABLED'];
+  let saved: Record<string, string | undefined> = {};
+  beforeEach(() => {
+    saved = {};
+    ENV_KEYS.forEach(k => (saved[k] = process.env[k]));
+    process.env.MEDIA_DOWNLOAD_MAX_BYTES = '1000';
+    process.env.MEDIA_DOWNLOAD_ENABLED = 'true';
+    runInPage.mockClear();
+  });
+  afterEach(() => {
+    ENV_KEYS.forEach(k => {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    });
+    delete g.window;
+    jest.restoreAllMocks();
+  });
+
+  /**
+   * A page holding message `M1`, whose decrypted media is `bytes` long; returns the encoder spy. `stage` is
+   * the media stage before the download, `resolvedStage` the one the page's own resolve step leaves.
+   */
+  function pageServing(
+    bytes: number,
+    page: { stage?: string; resolvedStage?: string; decrypt?: () => Promise<ArrayBuffer> } = {},
+  ): jest.Mock {
+    const toBase64 = jest.fn((buffer: ArrayBuffer) => Promise.resolve(Buffer.from(buffer).toString('base64')));
+    const pageMsg = {
+      mimetype: 'video/mp4',
+      filename: 'clip.mp4',
+      mediaData: { mediaStage: page.stage ?? 'RESOLVED' },
+      downloadMedia: () => {
+        pageMsg.mediaData.mediaStage = page.resolvedStage ?? 'RESOLVED';
+        return Promise.resolve();
+      },
+    };
+    const decrypt = page.decrypt ?? (() => Promise.resolve(new ArrayBuffer(bytes)));
+    g.window = {
+      require: (name: string) =>
+        name === 'WAWebCollections'
+          ? {
+              Msg: {
+                get: (id: string) => (id === 'M1' ? pageMsg : undefined),
+                getMessagesById: () => Promise.resolve({ messages: [] }),
+              },
+            }
+          : { downloadManager: { downloadAndMaybeDecrypt: decrypt } },
+      WWebJS: { arrayBufferToBase64Async: toBase64 },
+    };
+    return toBase64;
+  }
+
+  // The sender declares 10 bytes, well under the 1000-byte cap, so the pre-gate lets every case through.
+  const understated = (evaluate: jest.Mock) => ({
+    id: { _serialized: 'M1' },
+    _data: { size: 10, mimetype: 'video/mp4' },
+    ...onPage(evaluate),
+  });
+  const runInPage = jest.fn((fn: (arg: unknown) => Promise<unknown>, arg: unknown) => fn(arg));
+  const cap = (msg: unknown, override?: number): Promise<unknown> =>
+    (
+      new WhatsAppWebJsAdapter({
+        sessionId: 'media-2',
+        sessionDataPath: './data/sessions',
+        puppeteer: {},
+      }) as unknown as {
+        capInboundMediaFor: (m: unknown, o?: number) => Promise<unknown>;
+      }
+    ).capInboundMediaFor(msg, override);
+
+  it('drops a payload the page decrypted over the cap before encoding it, despite a small declared size', async () => {
+    const toBase64 = pageServing(5000);
+    const warn = jest.spyOn(LoggerService.prototype, 'warn').mockImplementation(() => undefined);
+
+    await expect(cap(understated(runInPage))).resolves.toEqual({
+      mimetype: 'video/mp4',
+      filename: 'clip.mp4',
+      omitted: true,
+      sizeBytes: 5000,
+    });
+    expect(toBase64).not.toHaveBeenCalled();
+    expect(runInPage).toHaveBeenCalledWith(downloadMediaInPage, { msgId: 'M1', maxBytes: 1000 });
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(
+      'Inbound media exceeds MEDIA_DOWNLOAD_MAX_BYTES; dropped payload, kept envelope',
+      expect.objectContaining({ msgId: 'M1', sizeBytes: 5000 }),
+    );
+  });
+
+  it('checks the payload in the page against a per-call override below the global cap', async () => {
+    const toBase64 = pageServing(700);
+
+    await expect(cap(understated(runInPage), 500)).resolves.toEqual(
+      expect.objectContaining({ omitted: true, sizeBytes: 700 }),
+    );
+    expect(runInPage).toHaveBeenCalledWith(downloadMediaInPage, { msgId: 'M1', maxBytes: 500 });
+    expect(toBase64).not.toHaveBeenCalled();
+  });
+
+  it.each<[string, { stage?: string; resolvedStage?: string }, string]>([
+    ['a page that does not offer the media yet', { stage: 'REUPLOADING' }, 'null'],
+    ['media whose resolve step fails', { stage: 'INIT', resolvedStage: 'ERROR_MISSING' }, 'undefined'],
+  ])('says why %s leaves the omitted marker', async (_case, page, answer) => {
+    pageServing(3, page);
+    const warn = jest.spyOn(LoggerService.prototype, 'warn').mockImplementation(() => undefined);
+
+    await expect(cap(understated(runInPage))).resolves.toEqual(expect.objectContaining({ omitted: true }));
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(
+      'Inbound media download returned nothing; emitting the omitted marker',
+      expect.objectContaining({ msgId: 'M1', answer }),
+    );
+  });
+
+  it('looks the message up by an id the WhatsApp Web build stores under $1', async () => {
+    // A bare `_serialized` read sends the page an empty id, which finds no message and comes back null.
+    pageServing(3);
+    const renamed = { ...understated(runInPage), id: { $1: 'M1' } };
+
+    await expect(cap(renamed)).resolves.toEqual({
+      mimetype: 'video/mp4',
+      filename: 'clip.mp4',
+      data: Buffer.alloc(3).toString('base64'),
+    });
+    expect(runInPage).toHaveBeenCalledWith(downloadMediaInPage, { msgId: 'M1', maxBytes: 1000 });
+  });
+
+  it('still inlines a payload within the cap', async () => {
+    pageServing(3);
+
+    await expect(cap(understated(runInPage))).resolves.toEqual({
+      mimetype: 'video/mp4',
+      filename: 'clip.mp4',
+      data: Buffer.alloc(3).toString('base64'),
+    });
+  });
+
+  // The comparison in the page and the one that plans the download are each one character from the wrong one.
+  it('inlines a payload of exactly the cap and drops one a byte over it', async () => {
+    pageServing(1000);
+    await expect(cap(understated(runInPage))).resolves.toEqual({
+      mimetype: 'video/mp4',
+      filename: 'clip.mp4',
+      data: Buffer.alloc(1000).toString('base64'),
+    });
+
+    pageServing(1001);
+    await expect(cap(understated(runInPage))).resolves.toEqual({
+      mimetype: 'video/mp4',
+      filename: 'clip.mp4',
+      omitted: true,
+      sizeBytes: 1001,
+    });
+  });
+
+  it('drops a payload over the cap by its received length even when the page reports it small', async () => {
+    const data = Buffer.alloc(2000).toString('base64');
+    const page = jest.fn().mockResolvedValue({ mimetype: 'video/mp4', data, sizeBytes: 10 });
+
+    await expect(cap(understated(page))).resolves.toEqual(expect.objectContaining({ omitted: true, sizeBytes: 2000 }));
+  });
+
+  // The rest of the page function is whatsapp-web.js's own download; these keep its outcomes intact.
+  type PageCase = { msgId?: string; stage?: string; resolvedStage?: string; decrypt?: () => Promise<ArrayBuffer> };
+  const notFound = () => Promise.reject(Object.assign(new Error('gone'), { status: 404 }));
+  it.each<[string, PageCase, null | undefined]>([
+    ['a message the page does not hold', { msgId: 'M2' }, null],
+    ['media the phone is re-uploading', { stage: 'REUPLOADING' }, null],
+    ['media whose resolve step fails', { stage: 'INIT', resolvedStage: 'ERROR_MISSING' }, undefined],
+    ['media still fetching after the resolve step', { stage: 'INIT', resolvedStage: 'FETCHING' }, undefined],
+    ['media the server no longer has', { decrypt: notFound }, undefined],
+  ])('returns %s as upstream does', async (_case, page, expected) => {
+    const toBase64 = pageServing(5, page);
+
+    await expect(downloadMediaInPage({ msgId: page.msgId ?? 'M1', maxBytes: 1000 })).resolves.toBe(expected);
+    expect(toBase64).not.toHaveBeenCalled();
+  });
+
+  it('resolves unresolved media in the page before downloading it', async () => {
+    pageServing(5, { stage: 'INIT' });
+
+    await expect(downloadMediaInPage({ msgId: 'M1', maxBytes: 1000 })).resolves.toEqual({
+      mimetype: 'video/mp4',
+      filename: 'clip.mp4',
+      sizeBytes: 5,
+      data: Buffer.alloc(5).toString('base64'),
+    });
+  });
+
+  // puppeteer rebuilds a page exception from its class name alone, and WhatsApp Web's classes are minified
+  // (`t: t`), so the page names the rejection itself, with the build it came from.
+  it('names any other download error with its WhatsApp Web build', async () => {
+    const failure = Object.assign(new Error('bad type'), { name: 'InvalidMediaFileType', status: 500 });
+    pageServing(5, { decrypt: () => Promise.reject(failure) });
+    (g.window as { Debug?: unknown }).Debug = { VERSION: '2.3000.1' };
+
+    await expect(downloadMediaInPage({ msgId: 'M1', maxBytes: 1000 })).rejects.toThrow(
+      'InvalidMediaFileType: bad type (WhatsApp Web 2.3000.1)',
+    );
+  });
+
+  // WhatsApp Web rejects with more than errors: a bare string, or an object that carries only a status
+  // (upstream reads e.status === 404), and the operator reads the warning that names it.
+  it.each([
+    ['a bare string', 'download refused', 'download refused (WhatsApp Web 2.3000.1)'],
+    ['an object with only a status', { status: 500 }, 'status 500 (WhatsApp Web 2.3000.1)'],
+    [
+      'an object with a name and a status',
+      { name: 'MediaError', status: 410 },
+      'MediaError: status 410 (WhatsApp Web 2.3000.1)',
+    ],
+    ['nothing at all', undefined, 'unknown rejection (WhatsApp Web 2.3000.1)'],
+  ])('names a rejection that is %s', async (_label, rejection, expected) => {
+    // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors
+    pageServing(5, { decrypt: () => Promise.reject(rejection) });
+    (g.window as { Debug?: unknown }).Debug = { VERSION: '2.3000.1' };
+
+    await expect(downloadMediaInPage({ msgId: 'M1', maxBytes: 1000 })).rejects.toThrow(expected);
+  });
+
+  // puppeteer ships downloadMediaInPage into the page as Function#toString(), so it can reach nothing of this
+  // module: a constant or helper it closes over resolves in Node, where every test above runs it, and throws
+  // ReferenceError in the page, where every download then fails. The source is compiled from the file with the
+  // project's compiler options and run in a context holding only the page's window and AbortController. The
+  // loaded copy is not used: coverage instruments it with counters the page does not have.
+  function shippedToPage(): typeof downloadMediaInPage {
+    const root = path.join(__dirname, '..', '..', '..');
+    const { config } = ts.readConfigFile(path.join(root, 'tsconfig.json'), name => fs.readFileSync(name, 'utf8')) as {
+      config: { compilerOptions: Record<string, unknown> };
+    };
+    const { options } = ts.convertCompilerOptionsFromJson({ ...config.compilerOptions, module: 'CommonJS' }, root);
+    const file = fs.readFileSync(path.join(__dirname, 'wwebjs-messaging.ts'), 'utf8');
+    const start = file.indexOf('async function downloadMediaInPage');
+    expect(start).toBeGreaterThan(-1);
+    const compiled = ts.transpileModule(file.slice(start, file.indexOf('\n}\n', start) + 2), {
+      compilerOptions: options,
+    }).outputText;
+    // Declared alongside whatever helpers the compiler hoisted, then sent as its own text, as puppeteer does.
+    const declared = vm.runInNewContext(`${compiled}\n;downloadMediaInPage`) as { toString(): string };
+    return vm.runInNewContext(`(${declared.toString()})`, {
+      window: (globalThis as unknown as { window: unknown }).window,
+      AbortController,
+    }) as typeof downloadMediaInPage;
+  }
+
+  const clip = { mimetype: 'video/mp4', filename: 'clip.mp4' };
+  it.each<[string, number, PageCase, unknown]>([
+    ['a payload within the cap', 3, {}, { ...clip, sizeBytes: 3, data: Buffer.alloc(3).toString('base64') }],
+    ['a payload over the cap', 5000, {}, { ...clip, sizeBytes: 5000, data: '' }],
+    ['unresolved media', 3, { stage: 'INIT' }, { ...clip, sizeBytes: 3, data: Buffer.alloc(3).toString('base64') }],
+    ['a message the page does not hold', 3, { msgId: 'M2' }, null],
+    ['media the phone is re-uploading', 3, { stage: 'REUPLOADING' }, null],
+    ['media whose resolve step fails', 3, { stage: 'INIT', resolvedStage: 'ERROR_MISSING' }, undefined],
+    ['media still fetching after the resolve step', 3, { stage: 'INIT', resolvedStage: 'FETCHING' }, undefined],
+    ['media the server no longer has', 3, { decrypt: notFound }, undefined],
+  ])('reaches nothing outside the page when it runs there: %s', async (_case, bytes, page, expected) => {
+    pageServing(bytes, page);
+
+    await expect(shippedToPage()({ msgId: page.msgId ?? 'M1', maxBytes: 1000 })).resolves.toEqual(expected);
+  });
+
+  it('reaches nothing outside the page when a download fails with any other error', async () => {
+    const failure = Object.assign(new Error('boom'), { status: 500 });
+    pageServing(3, { decrypt: () => Promise.reject(failure) });
+    (g.window as { Debug?: unknown }).Debug = { VERSION: '2.3000.1' };
+
+    await expect(shippedToPage()({ msgId: 'M1', maxBytes: 1000 })).rejects.toThrow(
+      'Error: boom (WhatsApp Web 2.3000.1)',
+    );
+  });
+
+  // downloadMediaInPage copies the page side of Message#downloadMedia. The fingerprint pins the whole
+  // upstream method, comments and formatting aside, so any whatsapp-web.js release that changes it fails
+  // here; the other checks hold the copy to upstream's modules, accessors, literals and call arguments.
+  // A tree an older OpenWA install patched carries the copy's `mimetype` option and is read without it.
+  it('matches the page download of the installed whatsapp-web.js', () => {
+    const squash = (src: string) =>
+      src
+        .replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, '')
+        .replace(/\s+/g, ' ')
+        .replace(/ ?([^\w$ ]) ?/g, '$1')
+        .replace(/,(?=[)}\]])/g, '');
+    const upstreamFile = fs.readFileSync(require.resolve('whatsapp-web.js/src/structures/Message.js'), 'utf8');
+    const start = upstreamFile.indexOf('async downloadMedia()');
+    const method = squash(upstreamFile.slice(start, upstreamFile.indexOf('\n    /**', start))).replace(
+      'type:msg.type,mimetype:msg.mimetype,signal:',
+      'type:msg.type,signal:',
+    );
+    const upstream = method.slice(method.indexOf('async(msgId)=>'), method.indexOf('},this.id._serialized'));
+    const ours = fs.readFileSync(path.join(__dirname, 'wwebjs-messaging.ts'), 'utf8');
+    const fn = ours.slice(ours.indexOf('export async function downloadMediaInPage'));
+    const own = squash(fn.slice(0, fn.indexOf('\n}\n'))).split('const collection=')[1] ?? '';
+    const members = (src: string) => [...new Set([...src.matchAll(/(?<!\.)\.([A-Za-z_]\w*)/g)].map(m => m[1]))].sort();
+    const literals = (src: string) => [...new Set([...src.matchAll(/'(\w+)'/g)].map(m => m[1]))].sort();
+    const call = (src: string, name: string) =>
+      (new RegExp(`\\.${name}\\(\\{[^}]*\\}\\)`).exec(src)?.[0] ?? '').replace(/downloadQpl:\w+/, 'downloadQpl:qpl');
+
+    expect(start).toBeGreaterThan(-1);
+    expect(createHash('sha256').update(method).digest('hex')).toBe(
+      'f70f7cd8393bc60149745b7901bb96eece28a2940eaee4725e71ce615cf9ec73',
+    );
+    expect(literals(own)).toEqual(literals(upstream));
+    // The copy measures the decrypted length instead of reporting the declared `size`, and names a
+    // rejection from its `name`, class, `message`, `status` and the page's `Debug.VERSION`.
+    expect(members(own)).toEqual(
+      [
+        ...members(upstream).filter(m => m !== 'size'),
+        'byteLength',
+        'maxBytes',
+        'msgId',
+        'sizeBytes',
+        'name',
+        'message',
+        'constructor',
+        'Debug',
+        'VERSION',
+      ].sort(),
+    );
+    expect(call(own, 'downloadMedia')).toBe(call(upstream, 'downloadMedia'));
+    expect(call(own, 'downloadAndMaybeDecrypt')).toBe(
+      call(upstream, 'downloadAndMaybeDecrypt').replace('type:msg.type,', 'type:msg.type,mimetype:msg.mimetype,'),
+    );
   });
 });
 
@@ -5544,7 +6545,7 @@ describe('WhatsAppWebJsAdapter message_ack (unreadable id)', () => {
     (adapter as unknown as { client: unknown }).client = client;
     const onMessageAck = jest.fn();
     (adapter as unknown as { callbacks: unknown }).callbacks = { onMessageAck };
-    (adapter as unknown as { setupEventHandlers: () => void }).setupEventHandlers();
+    (adapter as unknown as { lifecycle: WwebjsLifecycle }).lifecycle.setupEventHandlers();
     return { onMessageAck, client };
   };
 
@@ -5553,7 +6554,22 @@ describe('WhatsAppWebJsAdapter message_ack (unreadable id)', () => {
 
     client.emit('message_ack', { id: { _serialized: 'ACKED_MSG' } }, 3);
 
-    expect(onMessageAck).toHaveBeenCalledWith('ACKED_MSG', expect.any(String));
+    expect(onMessageAck).toHaveBeenCalledWith('ACKED_MSG', expect.any(String), undefined);
+  });
+
+  it('derives the acked message chat as Message._getChatId does', () => {
+    // Acks ride outbound messages, so the chat is the recipient, in a group and in a 1:1 chat alike.
+    const { onMessageAck, client } = wireAckHandler();
+
+    client.emit(
+      'message_ack',
+      { id: { _serialized: 'ACKED_OUT' }, fromMe: true, from: 'me@c.us', to: '120363000@g.us' },
+      3,
+    );
+    client.emit('message_ack', { id: { _serialized: 'ACKED_DM' }, fromMe: true, from: 'me@c.us', to: '621@c.us' }, 2);
+
+    expect(onMessageAck).toHaveBeenCalledWith('ACKED_OUT', expect.any(String), '120363000@g.us');
+    expect(onMessageAck).toHaveBeenCalledWith('ACKED_DM', expect.any(String), '621@c.us');
   });
 
   it('reads a renamed `$1` id when the dependency has not normalized it', () => {
@@ -5563,7 +6579,7 @@ describe('WhatsAppWebJsAdapter message_ack (unreadable id)', () => {
 
     client.emit('message_ack', { id: { $1: 'ACKED_RENAMED' } }, 3);
 
-    expect(onMessageAck).toHaveBeenCalledWith('ACKED_RENAMED', expect.any(String));
+    expect(onMessageAck).toHaveBeenCalledWith('ACKED_RENAMED', expect.any(String), undefined);
   });
 
   it('drops an ack whose id cannot be read instead of passing undefined on', () => {
@@ -5603,7 +6619,7 @@ describe('WhatsAppWebJsAdapter createGroup (not available on this engine)', () =
   it('refuses before the engine is ready, like every other guarded method', async () => {
     const adapter = new WhatsAppWebJsAdapter({ sessionId: 's', sessionDataPath: './data/sessions', puppeteer: {} });
 
-    await expect(adapter.createGroup('team', ['628123456789@c.us'])).rejects.toBeDefined();
+    await expect(adapter.createGroup('team', ['628123456789@c.us'])).rejects.toBeInstanceOf(EngineNotReadyError);
   });
 });
 
@@ -5634,7 +6650,7 @@ describe('WhatsAppWebJsAdapter puppeteer death detection (browser/page silent de
     (adapter as unknown as { callbacks: unknown }).callbacks = { onDisconnected };
     (adapter as unknown as { status: EngineStatus }).status = overrides.status ?? EngineStatus.READY;
     (adapter as unknown as { tearingDown: boolean }).tearingDown = overrides.tearingDown ?? false;
-    (adapter as unknown as { attachPuppeteerLifecycleListeners: () => void }).attachPuppeteerLifecycleListeners();
+    (adapter as unknown as { lifecycle: WwebjsLifecycle }).lifecycle.attachPuppeteerLifecycleListeners();
     return { adapter, client, onDisconnected };
   };
 
@@ -5739,6 +6755,22 @@ describe('WhatsAppWebJsAdapter.probeLiveness (session watchdog probe)', () => {
     await expect(adapter.probeLiveness()).resolves.toBe(false);
   });
 
+  it('asks the page when the session awaits operator action, so the watchdog can tell a live page from a dead one', async () => {
+    // The watchdog probes ACTION_REQUIRED observe-only; a probe that never asked reported "dead" for a
+    // healthy page and could never report the recovery.
+    const alive = adapterWith(
+      { getState: jest.fn().mockResolvedValue(WAState.CONNECTED) },
+      EngineStatus.ACTION_REQUIRED,
+    );
+    const gone = adapterWith(
+      { getState: jest.fn().mockRejectedValue(new Error('Target closed')) },
+      EngineStatus.ACTION_REQUIRED,
+    );
+
+    await expect(alive.probeLiveness()).resolves.toBe(true);
+    await expect(gone.probeLiveness()).resolves.toBe(false);
+  });
+
   it('resolves false without touching the client when the adapter is not READY', async () => {
     const getState = jest.fn();
     const adapter = adapterWith({ getState }, EngineStatus.AUTHENTICATING);
@@ -5801,8 +6833,8 @@ describe('WhatsAppWebJsAdapter navigation re-inject grace (#1081)', () => {
     (adapter as unknown as { callbacks: unknown }).callbacks = {};
     (adapter as unknown as { status: EngineStatus }).status = EngineStatus.READY;
     // Mirror the real init order: event handlers first, puppeteer listeners after initialize().
-    (adapter as unknown as { setupEventHandlers: () => void }).setupEventHandlers();
-    (adapter as unknown as { attachPuppeteerLifecycleListeners: () => void }).attachPuppeteerLifecycleListeners();
+    (adapter as unknown as { lifecycle: WwebjsLifecycle }).lifecycle.setupEventHandlers();
+    (adapter as unknown as { lifecycle: WwebjsLifecycle }).lifecycle.attachPuppeteerLifecycleListeners();
     return { adapter, client };
   };
 
@@ -5884,7 +6916,7 @@ describe('WhatsAppWebJsAdapter navigation re-inject grace (#1081)', () => {
     const { adapter, client } = wireAdapter();
 
     client.pupPage.emit('framenavigated', navFrame());
-    (adapter as unknown as { status: EngineStatus }).status = EngineStatus.ACTION_REQUIRED;
+    (adapter as unknown as { status: EngineStatus }).status = EngineStatus.DISCONNECTED;
 
     await expect(adapter.probeLiveness()).resolves.toBe(false);
     expect(client.getState).not.toHaveBeenCalled();
@@ -5926,6 +6958,53 @@ describe('WhatsAppWebJsAdapter navigation re-inject grace (#1081)', () => {
     await expect(adapter.probeLiveness()).resolves.toBe(true);
   });
 
+  it.each([false, true])('keeps a newer navigation after an older probe settles; previous=%s', async previous => {
+    jest.useFakeTimers();
+    const { adapter, client } = wireAdapter();
+    if (previous) client.pupPage.emit('framenavigated', navFrame());
+    let resolve!: (state: WAState) => void;
+    client.getState.mockReturnValueOnce(
+      new Promise<WAState>(done => {
+        resolve = done;
+      }),
+    );
+    const probe = adapter.probeLiveness();
+    client.pupPage.emit('framenavigated', navFrame());
+    resolve(WAState.CONNECTED);
+    await expect(probe).resolves.toBe(true);
+    await expect(adapter.getChats()).rejects.toBeInstanceOf(EngineNotReadyError);
+  });
+
+  it('keeps a newer recovery episode when overlapping probes settle out of order', async () => {
+    jest.useFakeTimers();
+    const { adapter, client } = wireAdapter();
+    let first!: (state: WAState) => void;
+    let second!: (state: WAState) => void;
+    client.getState
+      .mockReturnValueOnce(
+        new Promise<WAState>(done => {
+          first = done;
+        }),
+      )
+      .mockReturnValueOnce(
+        new Promise<WAState>(done => {
+          second = done;
+        }),
+      );
+    const older = adapter.probeLiveness();
+    client.pupPage.emit('framenavigated', navFrame());
+    const current = adapter.probeLiveness();
+    second(WAState.CONNECTED);
+    await expect(current).resolves.toBe(true);
+    const lifecycle = (adapter as unknown as { lifecycle: WwebjsLifecycle }).lifecycle;
+    expect(lifecycle.isInNavigationReinjectWindow()).toBe(false);
+    client.pupPage.emit('framenavigated', navFrame());
+    first(WAState.CONNECTED);
+    await expect(older).resolves.toBe(true);
+    expect(lifecycle.isInNavigationReinjectWindow()).toBe(true);
+    await expect(adapter.getChats()).rejects.toBeInstanceOf(EngineNotReadyError);
+  });
+
   it('does not report a transport-matching error as death inside the window (in-flight race)', () => {
     const { adapter, client } = wireAdapter();
     const report = (adapter as unknown as { reportIfPageTransportError: (e: unknown, c: string) => void })
@@ -5939,6 +7018,88 @@ describe('WhatsAppWebJsAdapter navigation re-inject grace (#1081)', () => {
     );
 
     expect(adapter.getStatus()).toBe(EngineStatus.READY);
+  });
+
+  describe('a call the reload kills while it runs, before the window is stamped', () => {
+    // What CDP answers for a call running when the page navigates, passed on by puppeteer with its prefix. The
+    // navigation itself is dispatched on a later turn, so the call's catch runs before the window exists.
+    const IN_FLIGHT = 'Protocol error (Runtime.callFunctionOn): Execution context was destroyed.';
+    const GROUP = '120363000000000000@g.us';
+
+    const wire = (overrides: Record<string, jest.Mock>) => {
+      const onDisconnected = jest.fn();
+      const { adapter, client } = wireAdapter(overrides as Partial<NavFakeClient>);
+      (adapter as unknown as { callbacks: unknown }).callbacks = { onDisconnected };
+      const navigateLater = async (): Promise<void> => {
+        await new Promise(resolve => setImmediate(resolve));
+        client.pupPage.emit('framenavigated', navFrame());
+      };
+      return { adapter, client, onDisconnected, navigateLater };
+    };
+
+    it('answers a read with the reload 409 and keeps the session ready', async () => {
+      const { adapter, onDisconnected, navigateLater } = wire({
+        getNumberId: jest.fn().mockRejectedValue(new Error(IN_FLIGHT)),
+      });
+
+      await expect(adapter.getNumberId('628123456789')).rejects.toEqual(
+        expect.objectContaining({ message: PAGE_RELOADING_MESSAGE }),
+      );
+      await navigateLater();
+
+      expect(adapter.getStatus()).toBe(EngineStatus.READY);
+      expect(onDisconnected).not.toHaveBeenCalled();
+    });
+
+    it('keeps the session ready when a send dies that way', async () => {
+      const { adapter, onDisconnected, navigateLater } = wire({
+        sendMessage: jest.fn().mockRejectedValue(new Error(IN_FLIGHT)),
+      });
+
+      await expect(adapter.sendTextMessage(GROUP, 'hi')).rejects.toThrow(IN_FLIGHT);
+      await navigateLater();
+
+      expect(adapter.getStatus()).toBe(EngineStatus.READY);
+      expect(onDisconnected).not.toHaveBeenCalled();
+    });
+
+    it('answers a reply whose quoted message read dies that way with the reload 409', async () => {
+      const { adapter, onDisconnected, navigateLater } = wire({
+        getChatById: jest.fn().mockRejectedValue(new Error(IN_FLIGHT)),
+      });
+
+      const error = await adapter.replyToMessage(GROUP, 'Q1', 'hi').catch((e: unknown) => e);
+      expect(error).toEqual(expect.objectContaining({ message: PAGE_RELOADING_MESSAGE }));
+      // Nothing was sent, so a keyed send frees its key for the retry the 409 asks for.
+      expect(provesNothingSent(error)).toBe(true);
+      await navigateLater();
+
+      expect(adapter.getStatus()).toBe(EngineStatus.READY);
+      expect(onDisconnected).not.toHaveBeenCalled();
+    });
+
+    it('still reports the session dead when the page then closes', async () => {
+      const { adapter, client, onDisconnected } = wire({
+        getNumberId: jest.fn().mockRejectedValue(new Error(IN_FLIGHT)),
+      });
+
+      await expect(adapter.getNumberId('628123456789')).rejects.toBeInstanceOf(EngineNotReadyError);
+      client.pupPage.emit('close');
+
+      expect(adapter.getStatus()).toBe(EngineStatus.DISCONNECTED);
+      expect(onDisconnected).toHaveBeenCalledWith('Page closed');
+    });
+
+    it('still reports a closed target as a death', async () => {
+      const { adapter, onDisconnected } = wire({
+        getNumberId: jest.fn().mockRejectedValue(new Error('Protocol error (Runtime.callFunctionOn): Target closed')),
+      });
+
+      await expect(adapter.getNumberId('628123456789')).rejects.toBeInstanceOf(EngineTransportError);
+
+      expect(adapter.getStatus()).toBe(EngineStatus.DISCONNECTED);
+      expect(onDisconnected).toHaveBeenCalledWith('Page transport error during getNumberId');
+    });
   });
 
   it('reports a transport-matching error as death again once the window expired', () => {
@@ -6136,6 +7297,39 @@ describe('WhatsAppWebJsAdapter orphaned Chromium sweep (pre-launch)', () => {
     // The cross-session leak that let a restart of sess-a SIGKILL sess-b's live browser: the sweep
     // substring-matches this marker against the full `ps` command line.
     expect(argsB).not.toContain('--openwa-session=sess-a');
+  });
+
+  describe('the browser locale', () => {
+    const argsWith = async (args: unknown): Promise<string[] | undefined> => {
+      const adapter = new WhatsAppWebJsAdapter({
+        sessionId: SESSION_ID,
+        sessionDataPath: './data/sessions',
+        puppeteer: { args: args as string[] },
+      });
+      await adapter.initialize({});
+      return (adapter as unknown as { client: { options: { puppeteer?: { args?: string[] } } } }).client.options
+        .puppeteer?.args;
+    };
+
+    it('is pinned on configured args as it is on the defaults', async () => {
+      const args = await argsWith(['--no-sandbox']);
+
+      expect(args).toEqual(expect.arrayContaining(['--no-sandbox', `--lang=${PINNED_BROWSER_LOCALE}`]));
+    });
+
+    it('keeps a locale the configured args already set', async () => {
+      const args = await argsWith(['--no-sandbox', '--lang=pt-BR']);
+
+      expect(args).toContain('--lang=pt-BR');
+      expect(args).not.toContain(`--lang=${PINNED_BROWSER_LOCALE}`);
+    });
+
+    it('falls back to the pinned defaults when the configured args are not a list', async () => {
+      const args = await argsWith('--no-sandbox');
+
+      expect(args).toEqual(expect.arrayContaining([...DEFAULT_PUPPETEER_ARGS, `--lang=${PINNED_BROWSER_LOCALE}`]));
+      expect(args).not.toContain('-');
+    });
   });
 
   it('SIGKILLs a Chromium process carrying this session marker and logs the sweep', async () => {
@@ -6344,6 +7538,79 @@ describe('WhatsAppWebJsAdapter page transport error detection (wedged page fast-
     ]);
     // The whole address book is read in a single in-page walk, not re-fetched per page.
     expect(evaluate).toHaveBeenCalledTimes(1);
+  });
+
+  // A contact migrated to privacy-id addressing is two WhatsApp Web records, its LID and its phone.
+  // whatsapp-web.js answers the LID record under the phone id (a plain string, the model's `phoneNumber`)
+  // but leaves `number` at the LID's digits, so the phone id came back twice, once with the wrong number.
+  const lidRecord = {
+    id: '628111@c.us',
+    pushname: 'Ally',
+    number: '262813461250071',
+    isMyContact: false,
+    isBlocked: false,
+  };
+  const phoneRecord = {
+    id: { _serialized: '628111@c.us' },
+    name: 'Alice',
+    number: '628111',
+    isMyContact: true,
+    isBlocked: false,
+  };
+
+  it.each([
+    ['the LID record first', [lidRecord, phoneRecord]],
+    ['the phone record first', [phoneRecord, lidRecord]],
+  ])('lists a contact held as a LID and a phone record once, with its phone as number (%s)', async (_order, rows) => {
+    const evaluate = jest.fn().mockResolvedValue({ rows, failed: 0 });
+    const { adapter } = readyAdapter({ pupPage: { evaluate } });
+
+    await expect(adapter.getContacts()).resolves.toEqual([
+      { id: '628111@c.us', name: 'Alice', pushName: 'Ally', number: '628111', isMyContact: true, isBlocked: false },
+    ]);
+  });
+
+  it('keeps a folded contact where its first copy was, and a block on either copy survives', async () => {
+    const other = { id: { _serialized: '999@c.us' }, name: 'Zed', number: '999', isMyContact: true, isBlocked: false };
+    const evaluate = jest.fn().mockResolvedValue({
+      rows: [lidRecord, other, { ...phoneRecord, isBlocked: true }],
+      failed: 0,
+    });
+    const { adapter } = readyAdapter({ pupPage: { evaluate } });
+
+    const contacts = await adapter.getContacts();
+
+    expect(contacts.map(c => c.id)).toEqual(['628111@c.us', '999@c.us']);
+    expect(contacts[0].isBlocked).toBe(true);
+  });
+
+  it('leaves a LID with no known phone under its @lid id and the number WhatsApp Web gave', async () => {
+    const unresolved = {
+      id: { _serialized: '262813461250071@lid' },
+      number: '262813461250071',
+      isMyContact: false,
+      isBlocked: false,
+    };
+    const evaluate = jest.fn().mockResolvedValue({ rows: [unresolved], failed: 0 });
+    const { adapter } = readyAdapter({ pupPage: { evaluate } });
+
+    await expect(adapter.getContacts()).resolves.toEqual([
+      { id: '262813461250071@lid', number: '262813461250071', isMyContact: false, isBlocked: false },
+    ]);
+  });
+
+  it('getContactById gives a contact answered under its phone id that phone as number', async () => {
+    const getContactById = jest.fn().mockResolvedValue({ ...lidRecord, name: 'Alice', isMyContact: true });
+    const { adapter } = readyAdapter({ getContactById });
+
+    await expect(adapter.getContactById('262813461250071@lid')).resolves.toEqual({
+      id: '628111@c.us',
+      name: 'Alice',
+      pushName: 'Ally',
+      number: '628111',
+      isMyContact: true,
+      isBlocked: false,
+    });
   });
 
   // #1476: an entry with no readable wid under either name (a shape wwebjs itself sometimes returns)
@@ -6619,7 +7886,8 @@ describe('WhatsAppWebJsAdapter group join + settings + own profile', () => {
 
     // The nine write routes that previously threw a bare Error('Chat is not a group') for a
     // non-group id (surfacing as an opaque 500) now share this guard: unknown id, 1:1 id and
-    // status id are all GroupNotFoundError (404), like the guarded settings writes above.
+    // status id are all GroupNotFoundError (404), like the guarded settings writes above. The
+    // membership-request approve/reject writes went straight to the page and answered 500 the same way.
     it.each([
       ['addParticipants', (a: WhatsAppWebJsAdapter) => a.addParticipants('628111@c.us', ['628222@c.us'])],
       ['removeParticipants', (a: WhatsAppWebJsAdapter) => a.removeParticipants('628111@c.us', ['628222@c.us'])],
@@ -6630,6 +7898,16 @@ describe('WhatsAppWebJsAdapter group join + settings + own profile', () => {
       ['setGroupDescription', (a: WhatsAppWebJsAdapter) => a.setGroupDescription('628111@c.us', 'New description')],
       ['getGroupInviteCode', (a: WhatsAppWebJsAdapter) => a.getGroupInviteCode('628111@c.us')],
       ['revokeGroupInviteCode', (a: WhatsAppWebJsAdapter) => a.revokeGroupInviteCode('628111@c.us')],
+      ['approveGroupMembershipRequests', (a: WhatsAppWebJsAdapter) => a.approveGroupMembershipRequests('628111@c.us')],
+      ['rejectGroupMembershipRequests', (a: WhatsAppWebJsAdapter) => a.rejectGroupMembershipRequests('628111@c.us')],
+      [
+        'approveGroupMembershipRequests (named)',
+        (a: WhatsAppWebJsAdapter) => a.approveGroupMembershipRequests('628111@c.us', ['628222@c.us']),
+      ],
+      [
+        'rejectGroupMembershipRequests (named)',
+        (a: WhatsAppWebJsAdapter) => a.rejectGroupMembershipRequests('628111@c.us', ['628222@c.us']),
+      ],
     ])('%s answers 404 (GroupNotFoundError) when the id is not a group', async (_name, call) => {
       const getChatById = jest.fn().mockResolvedValue({ isGroup: false });
       await expect(call(readyAdapter({ getChatById }))).rejects.toBeInstanceOf(GroupNotFoundError);
@@ -6655,6 +7933,16 @@ describe('WhatsAppWebJsAdapter group join + settings + own profile', () => {
     it('rejects with EngineNotSupportedError (501)', async () => {
       const err = await readyAdapter({})
         .setGroupEphemeral('g@g.us', 86400)
+        .catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(EngineNotSupportedError);
+      expect((err as EngineNotSupportedError).getStatus()).toBe(501);
+    });
+  });
+
+  describe('setGroupMemberLabel (no wwjs 1.34.7 API → honest 501)', () => {
+    it('rejects with EngineNotSupportedError (501)', async () => {
+      const err = await readyAdapter({})
+        .setGroupMemberLabel('g@g.us', 'Site A')
         .catch((e: unknown) => e);
       expect(err).toBeInstanceOf(EngineNotSupportedError);
       expect((err as EngineNotSupportedError).getStatus()).toBe(501);
@@ -7220,7 +8508,7 @@ describe('WhatsAppWebJsAdapter honest outcomes (no phantom success)', () => {
       const onStateChanged = jest.fn();
       (adapter as unknown as { client: unknown }).client = client;
       (adapter as unknown as { callbacks: unknown }).callbacks = { onActionRequired, onStateChanged };
-      (adapter as unknown as { setupEventHandlers: () => void }).setupEventHandlers();
+      (adapter as unknown as { lifecycle: WwebjsLifecycle }).lifecycle.setupEventHandlers();
       // Default: window.WWebJS present (reconcile probe) AND no modal (watcher ticks that aren't
       // overridden). mockResolvedValueOnce in a test takes precedence for exactly the next call.
       evaluate.mockResolvedValue(true);
@@ -7419,6 +8707,34 @@ describe('WhatsAppWebJsAdapter honest outcomes (no phantom success)', () => {
       }
     });
 
+    // A page navigation re-runs the inject, which fires 'authenticated' and then 'ready' again.
+    it('stays ACTION_REQUIRED through a re-inject and arms no readiness deadline', async () => {
+      jest.useFakeTimers();
+      try {
+        const { adapter, evaluate, client } = promoteToReady();
+
+        (client as EventEmitter).emit('authenticated');
+        await jest.advanceTimersByTimeAsync(2100);
+        for (let i = 0; i < 5; i++) {
+          evaluate.mockResolvedValueOnce({ modalPresent: true, dismissed: true } satisfies ModalProbe);
+          await jest.advanceTimersByTimeAsync(5100);
+        }
+        expect(adapter.getStatus()).toBe(EngineStatus.ACTION_REQUIRED);
+        const { reconcile: deadline } = adapter as unknown as { reconcile: { scheduleReadyReconcile: () => void } };
+        const reconcile = jest.spyOn(deadline, 'scheduleReadyReconcile');
+
+        (client as EventEmitter).emit('authenticated');
+        expect(adapter.getStatus()).toBe(EngineStatus.ACTION_REQUIRED);
+        (client as EventEmitter).emit('ready');
+        await jest.advanceTimersByTimeAsync(0);
+
+        expect(adapter.getStatus()).toBe(EngineStatus.ACTION_REQUIRED);
+        expect(reconcile).not.toHaveBeenCalled();
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
     // ── Dialog diagnostics (#1072 follow-up) ─────────────────────────────────────
     // When the probe finds nothing to click, the watcher asks the page what dialogs ARE visible,
     // so a modal whose title or button label the detector does not recognise lands in the logs
@@ -7547,7 +8863,7 @@ describe('WhatsAppWebJsAdapter honest outcomes (no phantom success)', () => {
       const logger = (adapter as unknown as { logger: { debug: (m: string, meta?: unknown) => void } }).logger;
       const debugSpy = jest.spyOn(logger, 'debug').mockImplementation(() => undefined);
 
-      (adapter as unknown as { reportActionRequired: (reason: string) => void }).reportActionRequired(
+      (adapter as unknown as { onboardingWatcher: WwebjsOnboardingWatcher }).onboardingWatcher.reportActionRequired(
         'modal stuck after five clicks',
       );
 
@@ -7581,7 +8897,14 @@ describe('probeOnboardingModal (in-page onboarding modal detection)', () => {
 
   const el = (
     textContent: string,
-    opts: { button?: boolean; roleButton?: boolean; hidden?: boolean; dialog?: boolean; ariaModal?: boolean } = {},
+    opts: {
+      button?: boolean;
+      roleButton?: boolean;
+      hidden?: boolean;
+      fixed?: boolean;
+      dialog?: boolean;
+      ariaModal?: boolean;
+    } = {},
   ): FakeEl => {
     const role = opts.roleButton ? 'button' : opts.dialog ? 'dialog' : null;
     return {
@@ -7589,7 +8912,8 @@ describe('probeOnboardingModal (in-page onboarding modal detection)', () => {
       role,
       textContent,
       parentElement: null,
-      offsetParent: opts.hidden ? null : {},
+      // Chromium answers a null offsetParent for a position: fixed element, which is still on screen.
+      offsetParent: opts.hidden || opts.fixed ? null : {},
       getBoundingClientRect: () => (opts.hidden ? { width: 0, height: 0 } : { width: 200, height: 40 }),
       getAttribute: (name: string) =>
         name === 'role' ? role : name === 'aria-modal' && opts.ariaModal ? 'true' : null,
@@ -7624,6 +8948,15 @@ describe('probeOnboardingModal (in-page onboarding modal detection)', () => {
 
   it('clicks Continue when it sits inside the onboarding modal', () => {
     const button = el('Continue', { button: true });
+    nest(el("What's new on WhatsApp Web"), button);
+    install([button]);
+
+    expect(probeOnboardingModal()).toEqual({ modalPresent: true, dismissed: true });
+    expect(button.click).toHaveBeenCalledTimes(1);
+  });
+
+  it('clicks a Continue rendered with position: fixed', () => {
+    const button = el('Continue', { button: true, fixed: true });
     nest(el("What's new on WhatsApp Web"), button);
     install([button]);
 
@@ -7851,7 +9184,14 @@ describe('collectDialogDiagnostics (in-page dialog diagnostics)', () => {
 
   const el = (
     textContent: string,
-    opts: { tag?: string; role?: string; ariaModal?: boolean; ariaLabel?: string; hidden?: boolean } = {},
+    opts: {
+      tag?: string;
+      role?: string;
+      ariaModal?: boolean;
+      ariaLabel?: string;
+      hidden?: boolean;
+      fixed?: boolean;
+    } = {},
   ): FakeEl => {
     const ariaLabel = opts.ariaLabel ?? null;
     return {
@@ -7861,7 +9201,8 @@ describe('collectDialogDiagnostics (in-page dialog diagnostics)', () => {
       ariaLabel,
       textContent,
       parentElement: null,
-      offsetParent: opts.hidden ? null : {},
+      // Chromium answers a null offsetParent for a position: fixed element, which is still on screen.
+      offsetParent: opts.hidden || opts.fixed ? null : {},
       getBoundingClientRect: () => (opts.hidden ? { width: 0, height: 0 } : { width: 200, height: 40 }),
       getAttribute: (name: string) => (name === 'aria-label' ? ariaLabel : null),
     };
@@ -7921,6 +9262,18 @@ describe('collectDialogDiagnostics (in-page dialog diagnostics)', () => {
     install([el('Alice12:34What’s new?'), el('Continue', { tag: 'BUTTON' })]);
 
     expect(collectDialogDiagnostics()).toEqual([]);
+  });
+
+  // Modal layers are commonly rendered with position: fixed.
+  it('reports a dialog rendered with position: fixed', () => {
+    const heading = el('A fresh look for WhatsApp Web', { role: 'heading' });
+    const button = el('Get started', { tag: 'BUTTON' });
+    const dialog = nest(el('', { role: 'dialog', fixed: true }), heading, button);
+    install([dialog, heading, button]);
+
+    expect(collectDialogDiagnostics()).toEqual([
+      { heading: 'A fresh look for WhatsApp Web', buttons: ['Get started'] },
+    ]);
   });
 
   it('ignores a dialog that is not visible', () => {
@@ -8029,7 +9382,7 @@ describe('WhatsAppWebJsAdapter account-restriction reporting', () => {
     const onDisconnected = jest.fn();
     (adapter as unknown as { client: unknown }).client = client;
     (adapter as unknown as { callbacks: unknown }).callbacks = { onAccountRestriction, onDisconnected };
-    (adapter as unknown as { setupEventHandlers: () => void }).setupEventHandlers();
+    (adapter as unknown as { lifecycle: WwebjsLifecycle }).lifecycle.setupEventHandlers();
     return { client, onAccountRestriction, onDisconnected };
   };
 
@@ -8455,12 +9808,17 @@ describe('WhatsAppWebJsAdapter raw-id extraction hardening', () => {
   it('getChatsByLabel skips an undefined entry (deleted chat behind the label) instead of a 500', async () => {
     const getChatsByLabelId = jest
       .fn()
-      .mockResolvedValue([undefined, { id: { _serialized: '628111@c.us' }, name: 'Kept', isGroup: false }, { id: {} }]);
+      .mockResolvedValue([
+        undefined,
+        { id: { _serialized: '628111@c.us' }, name: 'Kept', isGroup: false, lastMessage: { type: 'image' } },
+        { id: {} },
+      ]);
 
     const result = await readyAdapter({ getChatsByLabelId }).getChatsByLabel('7');
 
     expect(result).toHaveLength(1);
     expect(result[0].id).toBe('628111@c.us');
+    expect(result[0].lastMessageType).toBe('image');
   });
 
   // getNumberId returns a raw page-context Wid; on a WA Web build that renamed _serialized to $1,
@@ -8474,6 +9832,82 @@ describe('WhatsAppWebJsAdapter raw-id extraction hardening', () => {
     const missing = readyAdapter({ getNumberId: jest.fn().mockResolvedValue(null) });
     await expect(missing.getNumberId('628111')).resolves.toBeNull();
     await expect(missing.checkNumberExists('628111')).resolves.toBe(false);
+  });
+
+  // The interface answers in the neutral dialect (`<phone>@c.us`), as the Baileys engine does. WhatsApp
+  // Web names a migrated contact by its lid, an engine-private id that the number check must not expose.
+  it.each([
+    ['a bare number', '628111'],
+    ['a phone id', '628111@c.us'],
+    ['a number with a plus', '+628111'],
+  ])('getNumberId answers %s of a migrated contact with the phone id, not its lid', async (_label, input) => {
+    const getNumberId = jest.fn().mockResolvedValue({ _serialized: '159442138038327@lid' });
+    const getContactLidAndPhone = jest.fn().mockResolvedValue([{ lid: '159442138038327@lid', pn: '628111@c.us' }]);
+    const adapter = readyAdapter({ getNumberId, getContactLidAndPhone });
+
+    await expect(adapter.getNumberId(input)).resolves.toBe('628111@c.us');
+    await expect(adapter.checkNumberExists(input)).resolves.toBe(true);
+    expect(getNumberId).toHaveBeenCalledWith(input);
+    expect(getContactLidAndPhone).toHaveBeenCalledWith(['159442138038327@lid']);
+  });
+
+  // Brazil, Mexico and Argentina numbers exist on WhatsApp under another digit string than the one typed (the
+  // ninth digit). The number check reports the id WhatsApp knows, as the Baileys engine does.
+  it('getNumberId answers the phone WhatsApp holds for a migrated contact, not the digits typed', async () => {
+    const getNumberId = jest.fn().mockResolvedValue({ _serialized: '159442138038327@lid' });
+    const getContactLidAndPhone = jest
+      .fn()
+      .mockResolvedValue([{ lid: '159442138038327@lid', pn: '551187654321@c.us' }]);
+    const adapter = readyAdapter({ getNumberId, getContactLidAndPhone });
+
+    await expect(adapter.getNumberId('5511987654321')).resolves.toBe('551187654321@c.us');
+  });
+
+  it.each([
+    ['no mapping', []],
+    ['an empty phone', [{ lid: '159442138038327@lid', pn: '' }]],
+    ['no phone', [{ lid: '159442138038327@lid' }]],
+  ])('getNumberId keeps the typed number for a migrated contact WhatsApp Web has %s for', async (_label, mapping) => {
+    const getNumberId = jest.fn().mockResolvedValue({ _serialized: '159442138038327@lid' });
+    const adapter = readyAdapter({ getNumberId, getContactLidAndPhone: jest.fn().mockResolvedValue(mapping) });
+
+    await expect(adapter.getNumberId('+5511987654321')).resolves.toBe('5511987654321@c.us');
+  });
+
+  it('getNumberId does not read a phone for a contact that is not migrated', async () => {
+    const getNumberId = jest.fn().mockResolvedValue({ _serialized: '551187654321@c.us' });
+    const getContactLidAndPhone = jest.fn();
+    const adapter = readyAdapter({ getNumberId, getContactLidAndPhone });
+
+    await expect(adapter.getNumberId('5511987654321')).resolves.toBe('551187654321@c.us');
+    expect(getContactLidAndPhone).not.toHaveBeenCalled();
+  });
+
+  // The lookup already answered that the number exists; a failed read of its phone (a second page call that can
+  // run a second WhatsApp query) must not turn that answer into a 500.
+  it('getNumberId answers the typed number when the phone read fails, and logs it at debug', async () => {
+    const getNumberId = jest.fn().mockResolvedValue({ _serialized: '159442138038327@lid' });
+    const adapter = readyAdapter({
+      getNumberId,
+      getContactLidAndPhone: jest.fn().mockRejectedValue(new Error('Evaluation failed')),
+    });
+    const logger = (adapter as unknown as { logger: { debug: (m: string, meta?: unknown) => void } }).logger;
+    const debug = jest.spyOn(logger, 'debug').mockImplementation(() => undefined);
+
+    await expect(adapter.getNumberId('+5511987654321')).resolves.toBe('5511987654321@c.us');
+    expect(debug).toHaveBeenCalledWith(expect.stringContaining('phone'), { error: 'Error: Evaluation failed' });
+    // Existence is all checkNumberExists asks, so the phone read never reaches it.
+    await expect(adapter.checkNumberExists('5511987654321')).resolves.toBe(true);
+  });
+
+  it('getNumberId still answers 503 when the page dies during the phone read', async () => {
+    const getNumberId = jest.fn().mockResolvedValue({ _serialized: '159442138038327@lid' });
+    const adapter = readyAdapter({
+      getNumberId,
+      getContactLidAndPhone: jest.fn().mockRejectedValue(new Error('Protocol error: Target closed')),
+    });
+
+    await expect(adapter.getNumberId('5511987654321')).rejects.toBeInstanceOf(EngineTransportError);
   });
 
   it('getSubscribedChannels reads $1 on a renamed build, never the literal "undefined"', async () => {
@@ -8511,6 +9945,290 @@ describe('WhatsAppWebJsAdapter raw-id extraction hardening', () => {
     expect(info.id).toBe('120363000@g.us');
     expect(info.owner).toBe('628111@c.us');
     expect(info.participantCount).toBe(3);
+  });
+});
+
+/**
+ * The number check of a migrated contact through the library's own page code (Client.getNumberId,
+ * Client.getContactLidAndPhone and the injected WWebJS.enforceLidAndPnRetrieval) against a stand-in
+ * WhatsApp Web, counting the existence queries one check sends.
+ */
+describe('WhatsAppWebJsAdapter number check through the library page code', () => {
+  const g = globalThis as unknown as { window?: unknown };
+  const LID = '159442138038327@lid';
+  const PN = '551187654321@c.us';
+  afterEach(() => {
+    delete g.window;
+  });
+
+  /** The typed number exists under LID; `knownLocally` is whether the page already holds that lid's phone. */
+  function checkOn(page: { knownLocally: boolean; secondQuery?: 'fills' | 'throws' | 'absent' }) {
+    const wid = (id: string) => ({ _serialized: id, server: id.split('@')[1], user: id.split('@')[0] });
+    let mapped = page.knownLocally;
+    const queryWidExists = jest.fn((queried: { server: string }) => {
+      if (queried.server === 'lid') {
+        if (page.secondQuery === 'throws') return Promise.reject(new Error('query failed'));
+        if (page.secondQuery === 'absent') return Promise.resolve({});
+        mapped = true;
+      }
+      return Promise.resolve({ wid: wid(LID) });
+    });
+    const modules: Record<string, unknown> = {
+      WAWebWidFactory: { createWid: wid },
+      WAWebQueryExistsJob: { queryWidExists },
+      WAWebApiContact: { getPhoneNumber: () => (mapped ? wid(PN) : null), getCurrentLid: () => wid(LID) },
+    };
+    g.window = { require: (name: string) => modules[name] };
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    (require('whatsapp-web.js/src/util/Injected/Utils.js') as { LoadUtils: () => void }).LoadUtils();
+    const client = Object.assign(Object.create(Client.prototype) as object, {
+      pupPage: { evaluate: (fn: (...args: unknown[]) => unknown, ...args: unknown[]) => fn(...args) },
+    });
+    const adapter = new WhatsAppWebJsAdapter({ sessionId: 's', sessionDataPath: './data/sessions', puppeteer: {} });
+    (adapter as unknown as { status: EngineStatus }).status = EngineStatus.READY;
+    (adapter as unknown as { client: unknown }).client = client;
+    return { adapter, queryWidExists };
+  }
+
+  it('sends one query when the page already holds the phone of the lid', async () => {
+    const { adapter, queryWidExists } = checkOn({ knownLocally: true });
+    await expect(adapter.getNumberId('5511987654321')).resolves.toBe(PN);
+    expect(queryWidExists).toHaveBeenCalledTimes(1);
+  });
+
+  it('seeds an unknown lid from the page cache without replacing a newer shared phone or negative', async () => {
+    const pg = process.env.DATABASE_TYPE === 'postgres';
+    const server = {
+      type: 'postgres' as const,
+      host: process.env.DATABASE_HOST || '127.0.0.1',
+      port: Number(process.env.DATABASE_PORT || 5432),
+      username: process.env.DATABASE_USERNAME || 'openwa',
+      password: process.env.DATABASE_PASSWORD || 'openwa',
+      database: process.env.DATABASE_NAME || 'openwa',
+    };
+    const schema = `lid_lookup_${randomUUID().replace(/-/g, '')}`;
+    const admin = pg ? await new DataSource(server).initialize() : undefined;
+    if (admin) await admin.query(`CREATE SCHEMA "${schema}"`);
+    const entities = [LidMapping, Session];
+    const ds = await new DataSource(
+      pg
+        ? { ...server, schema, extra: { options: `-c search_path=${schema},public` }, entities, synchronize: true }
+        : { type: 'better-sqlite3', database: ':memory:', entities, synchronize: true },
+    ).initialize();
+    const [s1, s2] = ['00000001-0000-4000-8000-000000000000', '00000002-0000-4000-8000-000000000000'];
+    await ds.getRepository(Session).insert([s1, s2].map(id => ({ id, name: id, phone: '6290000000' })));
+    const repo = ds.getRepository(LidMapping);
+    const store = new LidMappingStoreService(repo);
+    const peer = new LidMappingStoreService(repo);
+    await store.onModuleInit();
+    await peer.onModuleInit();
+    const { adapter, queryWidExists } = checkOn({ knownLocally: true });
+    const engines = new EngineRegistry();
+    engines.set(s1, adapter);
+    const resolver = new SessionLidResolver(engines, store);
+    let clock = 0;
+    (resolver as unknown as { now: () => number }).now = () => clock;
+    const pending = new Set<Promise<boolean>>();
+    for (const method of ['remember', 'rememberIfUnknown'] as const) {
+      const real = store[method].bind(store);
+      jest.spyOn(store, method).mockImplementation((...args: Parameters<typeof store.remember>) => {
+        const promise = real(...(args as [string, string, string]));
+        pending.add(promise);
+        void promise.finally(() => pending.delete(promise));
+        return promise;
+      });
+    }
+    const settle = async () => {
+      for (let i = 0; i < 5; i++) {
+        await Promise.allSettled([...pending]);
+        await new Promise(resolve => setImmediate(resolve));
+      }
+    };
+    try {
+      await expect(resolver.resolveSenderPhone(s1, LID)).resolves.toBe('551187654321');
+      await settle();
+      expect(await repo.findOne({ where: { lid: '159442138038327' } })).toMatchObject({ phone: '551187654321' });
+      await peer.remember('159442138038327', '628222', s2);
+      await store.reload();
+      clock += 300_000;
+      await expect(resolver.resolveSenderPhone(s1, LID)).resolves.toBe('551187654321');
+      await settle();
+      expect(queryWidExists).not.toHaveBeenCalled();
+      expect(await repo.findOne({ where: { lid: '159442138038327' } })).toMatchObject({
+        phone: '628222',
+        sessionId: s2,
+      });
+      await peer.remember('159442138038327', null, s2);
+      await store.reload();
+      clock += 300_000;
+      await expect(resolver.resolveSenderPhone(s1, LID)).resolves.toBe('551187654321');
+      await settle();
+      expect(await repo.findOne({ where: { lid: '159442138038327' } })).toMatchObject({ phone: null });
+      for (const node of [store, peer]) {
+        const fence = new ChatScopeService(node);
+        const key = { allowedChats: [PN] };
+        expect(await fence.allows(key, LID)).toBe(false);
+        expect((await fence.scopeForFilter(key))!.allowed.has(LID)).toBe(false);
+      }
+      const restarted = new LidMappingStoreService(repo);
+      await restarted.onModuleInit();
+      expect(await restarted.findPhoneForLid(LID)).toBeNull();
+      await store.remember('159442138038327', '551187654321', s1);
+      const hidden = checkOn({ knownLocally: false, secondQuery: 'absent' });
+      engines.set(s1, hidden.adapter);
+      await expect(resolver.resolveSenderPhone(s1, LID)).resolves.toBeNull();
+      await settle();
+      expect(hidden.queryWidExists).toHaveBeenCalledTimes(1);
+      expect(await repo.findOne({ where: { lid: '159442138038327' } })).toMatchObject({ phone: null, sessionId: s1 });
+    } finally {
+      await ds.destroy();
+      if (admin) {
+        await admin.query(`DROP SCHEMA "${schema}" CASCADE`);
+        await admin.destroy();
+      }
+    }
+  });
+
+  it('sends a second query when the page does not, and answers the phone it reads', async () => {
+    const { adapter, queryWidExists } = checkOn({ knownLocally: false, secondQuery: 'fills' });
+    await expect(adapter.getNumberId('5511987654321')).resolves.toBe(PN);
+    expect(queryWidExists).toHaveBeenCalledTimes(2);
+  });
+
+  it('answers the typed number when that second query fails', async () => {
+    const { adapter, queryWidExists } = checkOn({ knownLocally: false, secondQuery: 'throws' });
+    await expect(adapter.getNumberId('5511987654321')).resolves.toBe('5511987654321@c.us');
+    expect(queryWidExists).toHaveBeenCalledTimes(2);
+  });
+});
+
+/**
+ * WhatsApp Web keys a migrated contact's chat by its LID, so the picture lookup by its phone id can come back
+ * empty or fail where the LID form answers. The lookup is retried once by the LID the page already holds.
+ */
+describe('WhatsAppWebJsAdapter profile picture of a migrated contact', () => {
+  const PHONE = '628111@c.us';
+  const LID = '159442138038327@lid';
+  const URL = 'https://pps.whatsapp.net/v/avatar.jpg';
+  const readyAdapter = (client: unknown): WhatsAppWebJsAdapter => {
+    const adapter = new WhatsAppWebJsAdapter({ sessionId: 's', sessionDataPath: './data/sessions', puppeteer: {} });
+    (adapter as unknown as { status: EngineStatus }).status = EngineStatus.READY;
+    (adapter as unknown as { client: unknown }).client = client;
+    return adapter;
+  };
+  /** A client whose picture lookup answers per id (a value, or an Error to throw), on a page holding `lid`. */
+  const clientWith = (answers: Record<string, string | undefined | Error>, lid: string | null = LID) => {
+    const getProfilePicUrl = jest.fn((id: string) => {
+      const answer = answers[id];
+      return answer instanceof Error ? Promise.reject(answer) : Promise.resolve(answer);
+    });
+    const evaluate = jest.fn().mockResolvedValue(lid);
+    return { getProfilePicUrl, pupPage: { evaluate } };
+  };
+
+  it('answers the phone form without reading the LID when it works', async () => {
+    const client = clientWith({ [PHONE]: URL });
+    await expect(readyAdapter(client).getProfilePicture(PHONE)).resolves.toBe(URL);
+    expect(client.pupPage.evaluate).not.toHaveBeenCalled();
+    expect(client.getProfilePicUrl).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['answers nothing', undefined],
+    ['fails in the page', new Error("Cannot read properties of undefined (reading 'id')")],
+  ])('retries by the LID when the phone form %s', async (_label, phoneAnswer) => {
+    const client = clientWith({ [PHONE]: phoneAnswer, [LID]: URL });
+    await expect(readyAdapter(client).getProfilePicture(PHONE)).resolves.toBe(URL);
+    expect(client.pupPage.evaluate).toHaveBeenCalledWith(expect.any(Function), PHONE);
+    expect(client.getProfilePicUrl.mock.calls).toEqual([[PHONE], [LID]]);
+  });
+
+  it.each([
+    ['nothing, then nothing', undefined, undefined, null],
+    ['nothing, then a failure', undefined, new Error('lid lookup failed'), null],
+  ])('answers as before when both forms give %s', async (_label, phoneAnswer, lidAnswer, expected) => {
+    const client = clientWith({ [PHONE]: phoneAnswer, [LID]: lidAnswer });
+    await expect(readyAdapter(client).getProfilePicture(PHONE)).resolves.toBe(expected);
+    expect(client.getProfilePicUrl).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ['nothing', undefined],
+    ['a failure', new Error('lid lookup failed')],
+  ])('answers 503 as before when the phone form fails and the LID form gives %s', async (_label, lidAnswer) => {
+    const client = clientWith({ [PHONE]: new Error('phone lookup failed'), [LID]: lidAnswer });
+    await expect(readyAdapter(client).getProfilePicture(PHONE)).rejects.toBeInstanceOf(EngineTransportError);
+    expect(client.getProfilePicUrl).toHaveBeenCalledTimes(2);
+  });
+
+  it('reports a page that dies during the retry and keeps the first answer', async () => {
+    const client = clientWith({
+      [PHONE]: undefined,
+      [LID]: new Error('Protocol error (Runtime.callFunctionOn): Target closed.'),
+    });
+    const adapter = readyAdapter(client);
+    const onDisconnected = jest.fn();
+    (adapter as unknown as { callbacks: unknown }).callbacks = { onDisconnected };
+    await expect(adapter.getProfilePicture(PHONE)).resolves.toBeNull();
+    expect(onDisconnected).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not retry when the page holds no LID for the phone', async () => {
+    const client = clientWith({ [PHONE]: undefined }, null);
+    await expect(readyAdapter(client).getProfilePicture(PHONE)).resolves.toBeNull();
+    expect(client.getProfilePicUrl).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not retry after a dead page or a protocol timeout', async () => {
+    for (const failure of [
+      new Error('Protocol error: Connection closed. Target closed'),
+      new Error("Runtime.callFunctionOn timed out. Increase the 'protocolTimeout' setting in launch/connect calls"),
+    ]) {
+      const client = clientWith({ [PHONE]: failure, [LID]: URL });
+      await expect(readyAdapter(client).getProfilePicture(PHONE)).rejects.toBeInstanceOf(EngineTransportError);
+      expect(client.pupPage.evaluate).not.toHaveBeenCalled();
+    }
+  });
+
+  it.each([
+    ['a group', '120363000000000001@g.us'],
+    ['a LID', LID],
+  ])('does not retry for %s', async (_label, id) => {
+    const client = clientWith({ [id]: undefined });
+    await expect(readyAdapter(client).getProfilePicture(id)).resolves.toBeNull();
+    expect(client.pupPage.evaluate).not.toHaveBeenCalled();
+  });
+
+  describe('readCurrentLid, the in-page read', () => {
+    const g = globalThis as unknown as { window?: unknown };
+    afterEach(() => {
+      delete g.window;
+    });
+    const pageHolding = (lid: { _serialized?: string; $1?: string } | null) => {
+      const queryWidExists = jest.fn();
+      const getCurrentLid = jest.fn(() => lid);
+      const modules: Record<string, unknown> = {
+        WAWebWidFactory: { createWid: (id: string) => ({ _serialized: id }) },
+        WAWebApiContact: { getCurrentLid },
+        WAWebQueryExistsJob: { queryWidExists },
+      };
+      g.window = { require: (name: string) => modules[name] };
+      return { getCurrentLid, queryWidExists };
+    };
+
+    it('reads the LID the page holds for a phone id, in either property name, and queries nothing', () => {
+      const page = pageHolding({ _serialized: LID });
+      expect(readCurrentLid(PHONE)).toBe(LID);
+      expect(page.getCurrentLid).toHaveBeenCalledWith({ _serialized: PHONE });
+      expect(page.queryWidExists).not.toHaveBeenCalled();
+      pageHolding({ $1: LID });
+      expect(readCurrentLid(PHONE)).toBe(LID);
+    });
+
+    it('answers null when the page holds none', () => {
+      pageHolding(null);
+      expect(readCurrentLid(PHONE)).toBeNull();
+    });
   });
 });
 

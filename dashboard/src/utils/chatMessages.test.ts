@@ -8,6 +8,7 @@ import {
   mergeChatMessages,
   mergeReactionSnapshot,
   liveMessageMetadata,
+  unacknowledgedIncomingIds,
   type EngineHistoryMessage,
 } from './chatMessages.ts';
 import { MENTION_CLOSE, MENTION_OPEN } from './messageFormatter.ts';
@@ -218,6 +219,75 @@ test('mergeOrAppend: DB-persisted prompt buttons survive a button-less echo', ()
   assert.deepEqual(after[0].metadata?.buttons, buttons);
 });
 
+test('mergeOrAppend preserves poll choices across duplicate and partial echoes', () => {
+  const poll = { name: 'Lunch?', options: ['Rice', 'Soup'], allowMultipleAnswers: false };
+  const before = msg({ type: 'poll', metadata: { poll } });
+  for (const metadata of [{ poll }, { media: undefined }]) {
+    const after = mergeOrAppend([before], msg({ type: 'poll', metadata }));
+    assert.deepEqual(after[0].metadata?.poll, poll);
+    assert.deepEqual(before.metadata, { poll });
+  }
+  const updated = { ...poll, options: ['Rice', 'Soup', 'Salad'] };
+  assert.deepEqual(
+    mergeOrAppend([before], msg({ type: 'poll', metadata: { poll: updated } }))[0].metadata?.poll,
+    updated,
+  );
+});
+
+test('mergeOrAppend keeps revocation terminal and removes content metadata', () => {
+  const original = msg({
+    type: 'poll',
+    metadata: {
+      poll: { name: 'Lunch?', options: ['Rice', 'Soup'], allowMultipleAnswers: false },
+      media: { mimetype: 'image/png', data: 'BASE64', archived: true },
+      quotedMessage: { id: 'q', body: 'quote' },
+      reactions: { me: 'yes' },
+    },
+  });
+  const revoked = msg({ type: 'revoked', body: '', metadata: undefined });
+  for (const [existing, incoming] of [
+    [original, revoked],
+    [revoked, original],
+  ]) {
+    const [result] = mergeOrAppend([existing], incoming);
+    assert.equal(result.type, 'revoked');
+    assert.equal(result.body, '');
+    assert.equal(result.metadata, undefined);
+  }
+  const [newRevoked] = mergeOrAppend([], { ...original, type: 'revoked' });
+  assert.equal(newRevoked.body, '');
+  assert.equal(newRevoked.metadata, undefined);
+  assert.equal(original.body, 'hello');
+  assert.ok(original.metadata?.poll);
+});
+
+test('mergeChatMessages keeps every revoked copy terminal regardless of source or duplicate order', () => {
+  const original = msg({
+    type: 'poll',
+    metadata: { poll: { name: 'Q', options: ['A'], allowMultipleAnswers: false } },
+  });
+  const revoked = { ...original, type: 'revoked' as const, body: '' };
+  for (const [rows, history] of [
+    [[original], [revoked]],
+    [[revoked], [original]],
+    [[revoked, original], []],
+    [[original, revoked], []],
+    [[], [revoked, original]],
+    [[], [original, revoked]],
+  ]) {
+    const [result] = mergeChatMessages(rows, history);
+    assert.equal(result.type, 'revoked');
+    assert.equal(result.body, '');
+    assert.equal(result.metadata, undefined);
+  }
+  assert.ok(original.metadata?.poll);
+});
+
+test('applyMessageEdit ignores a delayed edit for a revoked message', () => {
+  const before = [msg({ type: 'revoked', body: '' })];
+  assert.equal(applyMessageEdit(before, { messageId: before[0].waMessageId!, body: 'late' }), before);
+});
+
 test('mergeOrAppend dedupes a live WS message against its DB copy (id != id but same waMessageId)', () => {
   // DB-persisted copy: id = UUID, waMessageId = WA serialized id.
   const dbCopy = msg({ id: 'uuid-1', waMessageId: 'true_g@g.us_WA1', body: 'persisted' });
@@ -311,6 +381,38 @@ test('applyMessageEdit updates a live row by id', () => {
   assert.equal(after[0].body, '');
 });
 
+test('applyMessageEdit does not label a message whose text the event repeats', () => {
+  const before = [msg({ id: 'm-1', waMessageId: 'WA_EDIT_2', body: 'same', metadata: { reactions: { me: 'x' } } })];
+  const after = applyMessageEdit(before, { messageId: 'WA_EDIT_2', body: 'same' });
+  // The same list, so nothing renders again; compared as a boolean, since a failed deepEqual of rows is slow to print.
+  assert.ok(after === before, 'an unchanged text produced a new list');
+  assert.equal(after[0].metadata?.edited, undefined);
+  assert.deepEqual(after[0].metadata?.reactions, { me: 'x' });
+});
+
+test('liveMessageMetadata: carries the edited mark of a message announced as edited', () => {
+  const media = { mimetype: 'image/png', data: 'QUJD' };
+  assert.deepEqual(liveMessageMetadata({ edited: true }), { edited: true });
+  assert.deepEqual(liveMessageMetadata({ media, edited: true }), { media, edited: true });
+  assert.deepEqual(liveMessageMetadata({ metadata: { reactions: { me: 'x' } }, edited: true }), {
+    reactions: { me: 'x' },
+    edited: true,
+  });
+  assert.equal(liveMessageMetadata({}), undefined);
+});
+
+// The gateway announces the edit of a message it had not stored yet before the message itself, which then carries
+// the edited text and the mark.
+test('a message announced as edited after its edit missed the thread is labelled edited', () => {
+  const missed = applyMessageEdit([], { messageId: 'WA_EDIT_3', body: 'fixed' });
+  const live = { body: 'fixed', edited: true as const };
+  const after = mergeOrAppend(missed, msg({ id: 'WA_EDIT_3', body: live.body, metadata: liveMessageMetadata(live) }));
+
+  assert.equal(after[0].metadata?.edited, true);
+  const echo = mergeOrAppend(after, msg({ id: 'WA_EDIT_3', body: 'fixed', metadata: liveMessageMetadata({}) }));
+  assert.equal(echo[0].metadata?.edited, true, 'a later copy without the mark took it away');
+});
+
 test('applyMessageEdit is a referential no-op for an empty or unknown target id', () => {
   const before = [msg({ id: 'm-1', body: 'old' })];
   assert.equal(applyMessageEdit(before, { messageId: '', body: 'new' }), before);
@@ -353,20 +455,29 @@ test('senderKey prefers the participant JID and falls back to the display name',
   assert.equal(senderKey({}), undefined);
 });
 
-import { capMediaPayloads, MEDIA_PAYLOAD_CACHE_LIMIT } from './chatMessages.ts';
+import { capMediaPayloads, MEDIA_PAYLOAD_CACHE_LIMIT, mergeDeliveryStatus } from './chatMessages.ts';
 
 const mediaMsg = (id: string, data?: string): ChatMessageView =>
   msg({ id, type: 'image', metadata: { media: { mimetype: 'image/jpeg', filename: `${id}.jpg`, data } } });
+
+test('capMediaPayloads bounds archived previews together with inline media', () => {
+  const archive = { ...mediaMsg('old-archive'), mediaPath: 'media/old-archive.jpg' };
+  archive.metadata!.media = { mimetype: 'image/jpeg', omitted: true, archived: true };
+  const list = [archive, ...Array.from({ length: MEDIA_PAYLOAD_CACHE_LIMIT }, (_, i) => mediaMsg(`m-${i}`, 'X'))];
+  const capped = capMediaPayloads(list);
+  assert.equal(capped[0].metadata?.media?.archived, undefined);
+  assert.equal(capped[0].metadata?.media?.omitted, true);
+  assert.equal(list[0].metadata?.media?.archived, true, 'the source marker remains unchanged');
+});
 
 test('capMediaPayloads: under the limit the list is returned untouched (stable reference)', () => {
   const list = [mediaMsg('m-1', 'AAA'), mediaMsg('m-2', 'BBB'), msg({ id: 'm-3' })];
   assert.equal(capMediaPayloads(list), list);
 });
 
-test('the media cap covers the whole fetch window (no dead-end placeholder inside it)', () => {
-  // useChatMessages fetches a 100-message slice WITH media and caches it at staleTime: Infinity.
-  // A cap below the window strips payloads the user can scroll to, with no refetch path — the
-  // stripped rows render the 📎 placeholder forever even though the payload was fetched.
+test('the media cap is at least one fetched page (MESSAGE_PAGE_SIZE 100)', () => {
+  // A cap below one page would strip payloads from the first page a chat opens with; past one page the
+  // cap bounds the rendered set (see the MEDIA_PAYLOAD_CACHE_LIMIT doc).
   assert.ok(MEDIA_PAYLOAD_CACHE_LIMIT >= 100);
 });
 
@@ -633,4 +744,118 @@ test('a push name whose first word is invisible renders its first visible word, 
     const names = buildMentionNameMap([msg({ author: '6281112345@c.us', chatName: `${blank} Bob Smith` })]);
     assert.equal(resolveMentions('@6281112345', names), wrap('@Bob'));
   }
+});
+
+test('live and history poll choices survive metadata projection', () => {
+  const poll = { name: 'Q', options: ['a', 'b'], allowMultipleAnswers: true };
+  assert.deepEqual(liveMessageMetadata({ poll }), { poll });
+  const mapped = mapEngineHistoryMessage({
+    id: 'p',
+    chatId: 'c@c.us',
+    from: 'c@c.us',
+    to: 'me',
+    body: 'Q',
+    type: 'poll',
+    timestamp: 100,
+    fromMe: false,
+    isGroup: false,
+    kind: 'individual',
+    poll,
+  });
+  assert.deepEqual(mapped.metadata?.poll, poll);
+});
+
+test('legacy poll rows inherit available history choices without replacing stored state', () => {
+  const poll = { name: 'Q', options: ['a', 'b'], allowMultipleAnswers: false };
+  const historical = mapEngineHistoryMessage(hist({ type: 'poll', poll }));
+  const stored = { ...historical, status: 'delivered' as const, metadata: { reactions: { sender: 'ok' } } };
+  const merged = mergeChatMessages([stored], [historical])[0];
+  assert.equal(merged.status, 'delivered');
+  assert.deepEqual(merged.metadata, { reactions: { sender: 'ok' }, poll });
+  const revoked = mergeChatMessages([{ ...stored, type: 'revoked', body: '', metadata: undefined }], [historical])[0];
+  assert.equal(revoked.metadata?.poll, undefined);
+});
+
+test('capMediaPayloads: archived documents are download buttons, not previews, and are not counted', () => {
+  const document = (id: string): ChatMessageView =>
+    msg({ id, type: 'document', metadata: { media: { mimetype: 'application/pdf', omitted: true, archived: true } } });
+  const images = Array.from({ length: MEDIA_PAYLOAD_CACHE_LIMIT }, (_, i) => mediaMsg(`m-${i}`, 'X'));
+  const list = [...Array.from({ length: 5 }, (_, i) => document(`d-${i}`)), ...images];
+  assert.equal(capMediaPayloads(list), list, 'only the images count, and they fit');
+});
+
+// Retention deletes an archived copy and nulls the row's mediaPath, while a row an older gateway wrote can keep its
+// archived marker. Such a row is a download button, not a preview, so it takes no place a payload could hold.
+test('capMediaPayloads: an archived marker whose copy is gone is not counted', () => {
+  const purged = msg({
+    id: 'purged',
+    type: 'image',
+    mediaPath: null,
+    metadata: { media: { mimetype: 'image/jpeg', omitted: true, archived: true } },
+  });
+  const images = Array.from({ length: MEDIA_PAYLOAD_CACHE_LIMIT }, (_, i) => mediaMsg(`m-${i}`, 'X'));
+  const list = [purged, ...images];
+  assert.equal(capMediaPayloads(list), list, 'the purged row pushed a payload out');
+});
+
+test('capMediaPayloads: omitted markers that follow a full set of payloads strip none of them', () => {
+  const images = Array.from({ length: MEDIA_PAYLOAD_CACHE_LIMIT }, (_, i) => mediaMsg(`m-${i}`, 'X'));
+  const omitted = Array.from({ length: 120 }, (_, i) =>
+    msg({ id: `o-${i}`, type: 'image', metadata: { media: { mimetype: 'image/jpeg', omitted: true } } }),
+  );
+  const list = [...images, ...omitted];
+  assert.equal(capMediaPayloads(list), list);
+});
+
+test('mergeDeliveryStatus: a late lower tick never downgrades the shown one, and failed applies only before delivery', () => {
+  assert.equal(mergeDeliveryStatus('delivered', 'sent'), 'delivered');
+  assert.equal(mergeDeliveryStatus('read', 'delivered'), 'read');
+  assert.equal(mergeDeliveryStatus('sent', 'delivered'), 'delivered');
+  assert.equal(mergeDeliveryStatus('pending', 'sent'), 'sent');
+  assert.equal(mergeDeliveryStatus('delivered', 'failed'), 'delivered');
+  assert.equal(mergeDeliveryStatus('sent', 'failed'), 'failed');
+  assert.equal(mergeDeliveryStatus('failed', 'read'), 'failed');
+});
+
+test('applyMessageEdit marks the message and preserves reactions and media', () => {
+  const metadata = { reactions: { alice: '👍' }, media: { mimetype: 'image/jpeg', data: 'test' } };
+  const before = [msg({ id: 'edited', metadata })];
+  const after = applyMessageEdit(before, { messageId: 'edited', body: 'new caption' });
+  assert.deepEqual(after[0].metadata, { ...metadata, edited: true });
+  assert.deepEqual(before[0].metadata, metadata);
+});
+
+test('applyMessageEdit cannot mark or restore a revoked message', () => {
+  const before = [msg({ id: 'revoked', type: 'revoked', body: '' })];
+  assert.equal(applyMessageEdit(before, { messageId: 'revoked', body: 'late edit' }), before);
+});
+
+test('a later message echo preserves the edited marker', () => {
+  const before = [msg({ id: 'edited', waMessageId: 'edited', metadata: { edited: true } })];
+  const after = mergeOrAppend(
+    before,
+    msg({ id: 'edited', waMessageId: 'edited', metadata: { reactions: { alice: '👍' } } }),
+  );
+  assert.equal(after[0].metadata?.edited, true);
+  assert.deepEqual(after[0].metadata?.reactions, { alice: '👍' });
+});
+
+test('unacknowledgedIncomingIds names the newest incoming messages that no read has acknowledged', () => {
+  const incoming = (n: number, over: Partial<ChatMessage> = {}): ChatMessage =>
+    db({ id: `row-${n}`, waMessageId: `wamid.${n}`, direction: 'incoming', timestamp: n, ...over });
+  const thread = [
+    incoming(1),
+    incoming(2, { direction: 'outgoing' }),
+    incoming(3),
+    incoming(4, { waMessageId: undefined }),
+    // The gateway refuses an id with whitespace, and the whole read with it.
+    incoming(5, { waMessageId: 'has space' }),
+    incoming(6),
+  ];
+
+  assert.deepEqual(unacknowledgedIncomingIds(thread, new Set(), 100), ['wamid.1', 'wamid.3', 'wamid.6']);
+  assert.deepEqual(unacknowledgedIncomingIds(thread, new Set(['wamid.3']), 100), ['wamid.1', 'wamid.6']);
+  // Past the cap it is the newest that are named, in the order they were sent.
+  assert.deepEqual(unacknowledgedIncomingIds(thread, new Set(), 2), ['wamid.3', 'wamid.6']);
+  assert.deepEqual(unacknowledgedIncomingIds([], new Set(), 100), []);
 });

@@ -1,28 +1,32 @@
 import { Injectable, BadRequestException, NotFoundException, Optional } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { In, Repository } from 'typeorm';
+import { In, ObjectLiteral, Repository } from 'typeorm';
+import { Readable } from 'stream';
 import { EngineRegistry } from '../../engine/engine-registry.service';
 import { MessageProjector } from '../session/message-projector.service';
 import { SendTextMessageDto, SendMediaMessageDto, SendAudioMessageDto, MessageResponseDto } from './dto';
 import { SendTemplateMessageDto } from './dto/send-template.dto';
 import { ReplyMessageDto, ClickButtonDto } from './dto/message-actions.dto';
-import { Message, MessageDirection } from './entities/message.entity';
+import { Message } from './entities/message.entity';
 import { HookManager, applySendingGate } from '../../core/hooks';
 import { SendPacingService } from './send-pacing.service';
 import { createLogger } from '../../common/services/logger.service';
 import { resolveJidCandidates as expandJidCandidates } from '../../engine/identity/jid-candidates';
+import { parseWaId } from '../../engine/identity/wa-id';
 import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
 import { ChatMediaArchiveService } from '../chat-media/chat-media-archive.service';
 import { StorageService, isMissingObjectError } from '../../common/storage/storage.service';
 import { MessageSendService, SaveOutgoingMessageData } from './message-send.service';
+import { SessionWriteScope } from '../../common/utils/session-write-scope';
 // Type-only: the module binds this class to PLUGIN_MESSAGE_PORT with a `useExisting` alias, which
 // TypeScript does not check, so `implements` is what keeps the two in step.
 import type { PluginMessagePort } from '../../core/plugins/plugin-host-ports';
+import { MessageWindow, messageTimeBoundarySeconds, validateMessageWindow } from './message-window';
 
 // Re-exported for existing importers (bulk send shares the rendered-template cap with the send path).
 export { DEFAULT_TEMPLATE_RENDER_MAX_CHARS } from './message-send.service';
 
-export interface GetMessagesOptions {
+export interface GetMessagesOptions extends MessageWindow {
   chatId?: string;
   /** Filter by sender. A phone matches stored `@c.us`/`@s.whatsapp.net` ids AND any lid resolving to it. Group messages match on `author` (the real sender) as well as `from` (which holds the group JID). */
   from?: string;
@@ -139,6 +143,12 @@ export function spendInlineMediaBudget(messages: Message[], budgetBytes: number)
  */
 const MESSAGE_LIST_READ_CHUNK_MIN_BYTES = 1024 * 1024;
 
+/** The phone digits of a user JID (`<digits>@c.us` or `@s.whatsapp.net`), as a one-item list, or none. */
+function bareUserDigits(id: string): string[] {
+  const { kind, userPart } = parseWaId(id);
+  return kind === 'user' && /^\d+$/.test(userPart) ? [userPart] : [];
+}
+
 /** Pin window applied when the caller does not choose one — WhatsApp's own default of 24h. */
 export const DEFAULT_PIN_DURATION_SECONDS = 86400;
 
@@ -204,6 +214,19 @@ export class MessageService implements PluginMessagePort {
    */
   private get orderTiebreak(): 'rowid' | 'id' {
     return this.messageRepository.manager?.connection?.options?.type === 'postgres' ? 'id' : 'rowid';
+  }
+
+  /**
+   * The columns of a predicate, taken out of index consideration on SQLite, so a read of rows by `id` is a
+   * primary key lookup. Nothing runs ANALYZE there, and from about ten ids on it prefers an index on the session
+   * (or the chat) and visits every row of it, on the event loop. PostgreSQL has statistics and the plain
+   * predicate. The column is quoted because TypeORM only quotes a path that follows a space, `=` or `(`, and
+   * `from` is a keyword.
+   */
+  private byPrimaryKey(predicate: string): string {
+    return this.orderTiebreak === 'rowid'
+      ? predicate.replace(/\bmessage\.(?!id\b)(\w+)/g, '+"message"."$1"')
+      : predicate;
   }
 
   // ========== Outbound sends (delegated) ==========
@@ -287,8 +310,12 @@ export class MessageService implements PluginMessagePort {
   }
 
   /** Persist an outbound row; exposed for the bulk path, which reuses the send-persistence rules. */
-  saveOutgoingMessage(sessionId: string, data: SaveOutgoingMessageData): Promise<Message> {
-    return this.sender.saveOutgoingMessage(sessionId, data);
+  saveOutgoingMessage(
+    sessionId: string,
+    data: SaveOutgoingMessageData,
+    lifetime?: SessionWriteScope,
+  ): Promise<Message> {
+    return this.sender.saveOutgoingMessage(sessionId, data, lifetime);
   }
 
   /**
@@ -297,17 +324,24 @@ export class MessageService implements PluginMessagePort {
   async getMessages(
     sessionId: string,
     options: GetMessagesOptions = {},
-  ): Promise<{ messages: Message[]; total: number }> {
+  ): Promise<{ messages: Message[]; total: number; unknownTimestampTotal?: number }> {
     const { chatId, from, after, inlineMedia } = options;
+    validateMessageWindow(options);
+    const messageTimeOrder = options.orderBy === 'timestamp';
     // Sanitize pagination: a non-finite limit/offset — e.g. `?limit=abc` -> NaN —
     // must never reach TypeORM's take()/skip(). Clamp to sane bounds; fall back to defaults.
     const rawLimit = options.limit;
     const rawOffset = options.offset;
     const limit =
       typeof rawLimit === 'number' && Number.isFinite(rawLimit) ? Math.min(Math.max(Math.trunc(rawLimit), 1), 100) : 50;
-    const offset = typeof rawOffset === 'number' && Number.isFinite(rawOffset) ? Math.max(Math.trunc(rawOffset), 0) : 0;
+    // Capped at the largest safe integer: a driver refuses an OFFSET of 2^63 or more, and any offset that
+    // large is past the last row anyway.
+    const offset =
+      typeof rawOffset === 'number' && Number.isFinite(rawOffset)
+        ? Math.min(Math.max(Math.trunc(rawOffset), 0), Number.MAX_SAFE_INTEGER)
+        : 0;
 
-    const tiebreak = this.orderTiebreak;
+    const tiebreak = messageTimeOrder ? 'id' : this.orderTiebreak;
     // Match across dialects: a stored chatId may be `@s.whatsapp.net` (e.g. an outbound send addressed
     // by a raw engine id) while the caller filters by the neutral `@c.us` from the chat list - same
     // chat, different dialect. Resolving both sides through the table keeps them equal.
@@ -318,18 +352,18 @@ export class MessageService implements PluginMessagePort {
     // consideration, so it seeks (sessionId, chatId, createdAt) and sorts only that chat's rows, the
     // plan ANALYZE would pick. A single candidate already uses that index in order, and PostgreSQL
     // (no unary `+` on timestamps) has statistics, so both keep the plain key.
-    const createdAtKey =
-      tiebreak === 'rowid' && chatIds !== undefined && chatIds.length > 1 ? '+message.createdAt' : 'message.createdAt';
+    const orderColumn = messageTimeOrder ? 'timestamp' : 'createdAt';
+    const orderKey =
+      this.orderTiebreak === 'rowid' && chatIds !== undefined && chatIds.length > 1
+        ? `+message.${orderColumn}`
+        : `message.${orderColumn}`;
 
     const query = this.messageRepository
       .createQueryBuilder('message')
       .where('message.sessionId = :sessionId', { sessionId })
-      .orderBy(createdAtKey, 'DESC')
-      // `createdAt` is not unique: SQLite stores whole seconds, Postgres NOW() is transaction-scoped
-      // so a bulk write ties every row, and a history backfill stamps WhatsApp's own second-resolution
-      // timestamp. Without a tiebreaker the tie group's order is whatever the plan produces, and
-      // Postgres sorts it differently between two statements, so a page walk repeats some rows and
-      // never returns others. See `orderTiebreak` for why the key differs by dialect.
+      .orderBy(orderKey, 'DESC')
+      // Message times and bulk ingestion times can tie. The second key keeps pages stable;
+      // legacy ingestion order retains its dialect-specific tiebreaker.
       .addOrderBy(`message.${tiebreak}`, 'DESC')
       .take(limit);
 
@@ -340,9 +374,21 @@ export class MessageService implements PluginMessagePort {
       query.skip(offset);
     }
 
+    // The filters a page's rows are read against again once its ids are picked (readPageSpendingBudget). Not the
+    // whole query: that also carries the order, the page bounds and the cursor, which the picked ids encode.
+    const rowFilters: Array<[clause: string, parameters?: ObjectLiteral]> = [];
+    const narrow = (clause: string, parameters?: ObjectLiteral): void => {
+      query.andWhere(clause, parameters);
+      rowFilters.push([clause, parameters]);
+    };
+
     if (chatIds) {
-      query.andWhere('message.chatId IN (:...chatIds)', { chatIds });
+      narrow('message.chatId IN (:...chatIds)', { chatIds });
     }
+    if (options.direction !== undefined) {
+      narrow('message.direction = :direction', { direction: options.direction });
+    }
+    if (options.type !== undefined) narrow('message.type = :messageType', { messageType: options.type });
 
     if (from) {
       // Resolve the filter through the lid->phone table so a phone matches not just the stored
@@ -354,11 +400,32 @@ export class MessageService implements PluginMessagePort {
       // within the (sessionId, createdAt)-narrowed scan exactly as the from-only filter did, so the
       // OR costs nothing the old plan didn't already pay. No new index: per-session narrowing
       // dominates selectivity and a single btree cannot serve an OR across two columns anyway.
-      const froms = await this.resolveJidCandidates(from);
-      query.andWhere('(message.from IN (:...froms) OR message.author IN (:...authorFroms))', {
+      const candidates = await this.resolveJidCandidates(from);
+      // An API send stored by an earlier version names the account by its bare phone digits, so a filter on the
+      // account's JID still matches those rows.
+      const froms = [...new Set([...candidates, ...candidates.flatMap(bareUserDigits)])];
+      narrow('(message.from IN (:...froms) OR message.author IN (:...authorFroms))', {
         froms,
         authorFroms: froms,
       });
+    }
+
+    if (options.messageId !== undefined) {
+      narrow('message.waMessageId = :messageId', { messageId: options.messageId });
+    }
+    const hasTimeSelection = messageTimeOrder || options.since !== undefined || options.until !== undefined;
+    // Unknown times cannot belong to a verified time window. Count the gap within the same
+    // non-time filters, before applying time bounds, without loading message bodies.
+    const unknownTimestampTotal = hasTimeSelection
+      ? await query.clone().andWhere('message.timestamp IS NULL').getCount()
+      : undefined;
+    if (messageTimeOrder) narrow('message.timestamp IS NOT NULL');
+    // Integer seconds preserve both boundaries with ceil; fractional bigint parameters fail on PostgreSQL.
+    if (options.since !== undefined) {
+      narrow('message.timestamp >= :since', { since: messageTimeBoundarySeconds(options.since) });
+    }
+    if (options.until !== undefined) {
+      narrow('message.timestamp < :until', { until: messageTimeBoundarySeconds(options.until) });
     }
 
     // A budget of 0 means "never inline" and grants no single-payload allowance, which is exactly
@@ -369,6 +436,21 @@ export class MessageService implements PluginMessagePort {
     const total = await query.clone().getCount();
 
     if (after !== undefined) {
+      // A selection cursor must name a row inside this same selection, not merely a row from the
+      // session. Otherwise an unrelated time/direction/type could silently truncate a valid walk. A chat or
+      // sender filter is left out: its candidate set can change between pages (a lid mapping learned or lost),
+      // and the cursor is only a position in time, so a row stored under an alias must still anchor the walk.
+      if (
+        (messageTimeOrder ||
+          options.since !== undefined ||
+          options.until !== undefined ||
+          options.direction !== undefined ||
+          options.type !== undefined ||
+          options.messageId !== undefined) &&
+        !(await query.clone().andWhere('message.id = :cursorId', { cursorId: after }).getCount())
+      ) {
+        throw new BadRequestException('Unknown cursor for this message selection');
+      }
       // The anchor's sort key is resolved INSIDE the statement. Carrying it in the cursor instead
       // would mean round-tripping a timestamp through JSON, and neither dialect survives that:
       // SQLite holds two text shapes for one instant (`datetime('now')` writes 19 chars, a stamped
@@ -376,8 +458,8 @@ export class MessageService implements PluginMessagePort {
       // microseconds to a millisecond Date. Both mis-seek silently, which is the very failure this
       // cursor exists to remove.
       query.andWhere(
-        `(message.createdAt, message.${tiebreak}) < ` +
-          `(SELECT anchor."createdAt", anchor."${tiebreak}" FROM messages anchor ` +
+        `(message.${orderColumn}, message.${tiebreak}) < ` +
+          `(SELECT anchor."${orderColumn}", anchor."${tiebreak}" FROM messages anchor ` +
           'WHERE anchor."id" = :after AND anchor."sessionId" = :sessionId)',
         { after, sessionId },
       );
@@ -402,9 +484,13 @@ export class MessageService implements PluginMessagePort {
     }
 
     // The 1..100 clamp above bounds the ROW COUNT, not the response: each row carries its inline
-    // base64 in metadata.media.data. Spent newest-first (the query orders createdAt DESC), so the
+    // base64 in metadata.media.data. Spent newest-first in the selected order, so the
     // most recently viewed media still arrives inline and the rest keeps its omitted marker.
-    return { messages: await this.readPageSpendingBudget(sessionId, page, inlineMediaBudget), total };
+    return {
+      messages: await this.readPageSpendingBudget(sessionId, rowFilters, page, inlineMediaBudget),
+      total,
+      ...(unknownTimestampTotal !== undefined ? { unknownTimestampTotal } : {}),
+    };
   }
 
   /**
@@ -422,7 +508,7 @@ export class MessageService implements PluginMessagePort {
       .select('message.id', 'id')
       .addSelect('OCTET_LENGTH(message.metadata)', 'metadataLength')
       .where('message.id IN (:...pageIds)', { pageIds })
-      .andWhere('message.sessionId = :sessionId', { sessionId })
+      .andWhere(`${this.byPrimaryKey('message.sessionId')} = :sessionId`, { sessionId })
       .getRawMany<{ id: string; metadataLength: number | string | null }>();
     const sizeById = new Map(sizes.map(r => [r.id, r.metadataLength]));
     return pageIds.map(id => ({ id, metadataLength: sizeById.get(id) ?? null }));
@@ -432,10 +518,12 @@ export class MessageService implements PluginMessagePort {
    * Load the rows of a page in its order, in chunks of at most `max(budget, 1 MiB)` stored metadata
    * bytes (at least one row per chunk), spending the inline media budget on each chunk before the
    * next is read. Loading the whole page at once put every payload on the heap before the budget
-   * dropped most of them. A row deleted since the page was picked is left out.
+   * dropped most of them. The rows are re-read against the filters of the selection, so a row deleted or
+   * replaced since the page was picked, and no longer matching, is left out.
    */
   private async readPageSpendingBudget(
     sessionId: string,
+    filters: Array<[clause: string, parameters?: ObjectLiteral]>,
     page: Array<{ id: string; metadataLength: number | string | null }>,
     budgetBytes: number,
   ): Promise<Message[]> {
@@ -446,7 +534,13 @@ export class MessageService implements PluginMessagePort {
     let chunkBytes = 0;
 
     const flush = async (): Promise<void> => {
-      const rows = await this.messageRepository.find({ where: { id: In(chunk), sessionId } });
+      const query = this.messageRepository
+        .createQueryBuilder('message')
+        .select('message')
+        .where(`${this.byPrimaryKey('message.sessionId')} = :sessionId`, { sessionId })
+        .andWhere('message.id IN (:...chunkIds)', { chunkIds: chunk });
+      for (const [clause, parameters] of filters) query.andWhere(this.byPrimaryKey(clause), parameters);
+      const rows = await query.getMany();
       const byId = new Map(rows.map(row => [row.id, row]));
       for (const id of chunk) {
         const row = byId.get(id);
@@ -491,18 +585,6 @@ export class MessageService implements PluginMessagePort {
     return [...new Set([value, ...expanded])];
   }
 
-  /**
-   * Save incoming message (called from session webhook dispatch)
-   */
-  async saveIncomingMessage(sessionId: string, data: Partial<Message>): Promise<Message> {
-    const message = this.messageRepository.create({
-      ...data,
-      sessionId,
-      direction: MessageDirection.INCOMING,
-    });
-    return this.messageRepository.save(message);
-  }
-
   // ========== Phase 3: Reactions ==========
 
   async reactToMessage(sessionId: string, dto: { chatId: string; messageId: string; emoji: string }): Promise<void> {
@@ -515,14 +597,19 @@ export class MessageService implements PluginMessagePort {
     return engine.getMessageReactions(chatId, messageId);
   }
 
+  async getMessageReceipts(sessionId: string, chatId: string, messageId: string) {
+    const engine = this.getEngine(sessionId);
+    return engine.getMessageReceipts(chatId, messageId);
+  }
+
   /**
    * Read a message's media: the archived file when one exists, else the inline copy persisted on
    * the message row. The fallback is what makes media sent BY the account retrievable here — the
-   * archive is written only on the inbound path, but outbound rows carry the payload inline: the
-   * REST send persists it, wwjs downloads it for the own-send echo, and Baileys downloads it for
-   * phone-composed fromMe messages (the Baileys API-send echo alone carries only a marker, which
-   * the REST-persisted copy covers) — #1165. It also serves an inbound message whose archived file
-   * was purged by retention while the inline copy lives on.
+   * archive covers outbound media only when CHAT_MEDIA_ARCHIVE_OUTBOUND=true, but outbound rows
+   * carry the payload inline: the REST send persists it, wwjs downloads it for the own-send echo, and
+   * Baileys downloads it for phone-composed fromMe messages (the Baileys API-send echo alone carries
+   * only a marker, which the REST-persisted copy covers) — #1165. It also serves an inbound message
+   * whose archived file was purged by retention while the inline copy lives on.
    *
    * Unlike status media (only ever an image, a video or a voice note), chat media includes documents
    * a sender chose the type of — so the declared mimetype is echoed back only when it is inert, and the caller
@@ -533,12 +620,15 @@ export class MessageService implements PluginMessagePort {
     sessionId: string,
     chatId: string,
     messageId: string,
-  ): Promise<{ buffer: Buffer; mimetype: string }> {
+  ): Promise<{ stream: Readable; size?: number; mimetype: string }> {
     const chatIds = await this.resolveJidCandidates(chatId);
     const media = await this.chatMediaArchive?.getMedia(sessionId, chatIds, messageId);
     if (media && this.storageService) {
       try {
-        return { buffer: await this.storageService.getFile(media.path), mimetype: inertMimetype(media.mimetype) };
+        // Streamed, not read whole: an archived video can be as large as CHAT_MEDIA_ARCHIVE_MAX_BYTES.
+        // A missing or unreadable file rejects here, before anything is answered.
+        const { stream, size } = await this.storageService.openFile(media.path);
+        return { stream, size, mimetype: inertMimetype(media.mimetype) };
       } catch (error) {
         // The row outlived its file: the retention purge (or a concurrent delete) removed it
         // between the DB read and this read. Not a server fault — try the inline copy instead.
@@ -571,7 +661,8 @@ export class MessageService implements PluginMessagePort {
     ) {
       throw new NotFoundException('No media stored for this message');
     }
-    return { buffer: Buffer.from(inline.data, 'base64'), mimetype: inertMimetype(inline.mimetype) };
+    const bytes = Buffer.from(inline.data, 'base64');
+    return { stream: Readable.from([bytes]), size: bytes.length, mimetype: inertMimetype(inline.mimetype) };
   }
 
   /** Maximum messages a single getChatHistory call may request from the engine. */
@@ -658,12 +749,20 @@ export class MessageService implements PluginMessagePort {
     dto: { chatId: string; messageId: string; forEveryone?: boolean },
   ): Promise<void> {
     const engine = this.getEngine(sessionId);
-    await engine.deleteMessage(dto.chatId, dto.messageId, dto.forEveryone ?? true);
+    const deleted = await engine.deleteMessage(dto.chatId, dto.messageId, dto.forEveryone ?? true);
 
     // Clear the stored message the same way an engine revoke does (body, media and metadata), on
     // its mutation chain. Best-effort: never rejects. No localized display string is persisted
     // here; the dashboard renders the localized "message deleted" text.
-    await this.messageProjector.recordRevoke(sessionId, dto.messageId);
+    //
+    // Under the id the caller named (Baileys keys its rows by it, and so does a row an earlier engine stored) and,
+    // when the engine found the message under another form of that id, under the one it keys it by: whatsapp-web.js
+    // also takes the bare key id of a message it stores under the serialized id.
+    const source = { kind: 'revoke', chatId: dto.chatId } as const;
+    await this.messageProjector.recordRevoke(sessionId, dto.messageId, source);
+    if (typeof deleted === 'string' && deleted && deleted !== dto.messageId) {
+      await this.messageProjector.recordRevoke(sessionId, deleted, source);
+    }
   }
 
   // ========== Edit Message ==========
@@ -684,7 +783,11 @@ export class MessageService implements PluginMessagePort {
     // Best-effort: reflect the new body in the stored copy (mirrors deleteMessage's revoked flag),
     // serialized with the inbound edit/reaction writers through the session's per-message mutation
     // queue. A missing row must not fail the request — the engine edit already succeeded.
-    await this.messageProjector.recordOutboundMessageEdit(sessionId, finalDto.messageId, finalDto.body);
+    await this.messageProjector.recordOutboundMessageEdit(sessionId, finalDto.messageId, finalDto.body, {
+      kind: 'edit',
+      chatId: finalDto.chatId,
+      fromMe: true,
+    });
     return { messageId: result.id, timestamp: result.timestamp };
   }
 
@@ -705,9 +808,10 @@ export class MessageService implements PluginMessagePort {
     // Every gated sender's DTO addresses its destination as `chatId` except forward, which uses
     // `toChatId` — without the fallback a forward skipped the cold-reachout gate entirely, while
     // its persisted row still drained the cold budget. Edit carries a chatId too; the edited
-    // message's own row already makes that chat warm, so the gate is a no-op there.
+    // message's own row already makes that chat warm, so the cold rule is a no-op there. An edit
+    // writes no row, so it is judged against the caps without being held as a new send.
     const target = input as { chatId?: string; toChatId?: string };
-    await this.pacing.assertSendAllowed(sessionId, target.chatId ?? target.toChatId);
+    await this.pacing.assertSendAllowed(sessionId, target.chatId ?? target.toChatId, { hold: false });
     return applySendingGate(this.hookManager, sessionId, type, input, 'MessageService');
   }
 

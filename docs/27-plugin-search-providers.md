@@ -15,9 +15,10 @@ A **search-provider plugin** owns a search backend. It does two things:
    `SearchResults` to the caller.
 
 The core never talks to the search backend directly — all vendor-specific logic (the query builder, the
-API client, the index schema) lives in the plugin. Swapping backends is a config change
-(`SEARCH_PROVIDER`), not a code change. See [26 - Global Search](./26-global-search.md) for the
-user-facing feature and the built-in DB-FTS default.
+API client, the index schema) lives in the plugin. Swapping backends means enabling another plugin, not
+a code change: under the default `SEARCH_PROVIDER=auto` an enabled plugin supersedes the built-in (see
+27.4), and `SEARCH_PROVIDER` accepts no plugin id. See [26 - Global Search](./26-global-search.md) for
+the user-facing feature and the built-in DB-FTS default.
 
 ## 27.2 The contract
 
@@ -48,7 +49,7 @@ returns a `SearchResults`:
 
 ```ts
 ctx.registerSearchProvider(async (query) => {
-  // query: SearchQuery — { q, sessionIds?, sessionId?, chatId?, direction?, type?, from?, dateFrom?, dateTo?, limit?, offset? }
+  // query: SearchQuery, { q, match?, sessionIds?, sessionId?, chatId?, direction?, type?, from?, dateFrom?, dateTo?, limit?, offset? }
   // Run your backend's query here (e.g. a Meilisearch /search call).
   return {
     hits: [...],   // SearchHit[] — see below
@@ -58,6 +59,10 @@ ctx.registerSearchProvider(async (query) => {
   };
 });
 ```
+
+`match` is `'word'` (also when absent) or `'contains'` (any part of a word, ignoring case and accents);
+treat it as your backend allows. `SEARCH_CONTAINS_ENABLED` only gates the built-in provider's trigram
+index, so a plugin receives `contains` whatever that setting says.
 
 A plugin may register **one** search handler (calling `registerSearchProvider` again replaces it; the
 host is notified once). If `onEnable` throws after registering, the host cleans up (the provider is
@@ -89,8 +94,10 @@ text (escape-then-highlight), never as HTML. Do not inject HTML.
 ## 27.3 Indexing via the `message:persisted` hook
 
 The core fires `message:persisted` for every live message (outbound on send, inbound on receive, and again
-when a stored message is revoked) — never for history backfill. Register a handler to keep your index in
-sync:
+when a stored message is edited or revoked) — never for history backfill, with one exception. A message that
+a history sync reports deleted is handed over as its cleared row (`type: 'revoked'`, empty `body`), so an index drops
+the content; that row can be one your index never received, and a later sync that carries the message again hands it
+over again. Register a handler to keep your index in sync:
 
 ```ts
 ctx.registerHook('message:persisted', async hookCtx => {
@@ -110,6 +117,11 @@ and treat every emission as an upsert, and your index always converges to the fi
 stored row and emits `message:persisted` again with the same `id`, an empty `body`, `type: 'revoked'` and
 null `metadata`. An upsert keyed by `id` therefore drops the deleted content from your index; do not count
 the emission as a new message.
+
+**An edit re-emits the row too.** When an edit changes a stored message's text (an engine edit, or
+`POST /messages/edit`), the core emits `message:persisted` again with the same `id`, the new `body` and
+`metadata.edited: true`. An edit that repeats the stored text, or names a message of another chat, emits
+nothing. Upsert by `id` as for every other emission.
 
 One race remains visible by design: when the engine's own-send echo wins, the redundant PENDING row is
 merged into the echo's row and then dropped. The core emits `message:persisted` for the surviving row
@@ -148,10 +160,20 @@ Backfilled items carry only the WhatsApp id (`id` there is the WhatsApp message 
 Keep a `waMessageId` lookup too, and when a later `message:persisted` arrives for a message you already
 backfilled, upsert onto that document instead of adding a second one.
 
-Start the backfill from `onEnable` without awaiting it: a sandboxed lifecycle call is cut off after 30 s,
-and walking every chat's history takes longer on a real deployment. Record a marker in `ctx.storage` (which
-needs the `storage:use` permission) when it finishes so a restart does not repeat it. The built-in DB-FTS
-provider is unaffected (its index is DB-synced via triggers on every insert, including backfill).
+Start the backfill per session from a `ctx.registerHook('session:ready', ...)` handler (the session is
+`hookCtx.sessionId`), without awaiting it: a sandboxed hook is cut off after 5 s and a lifecycle call
+after 30 s, and walking every chat's history takes longer on a real deployment. Do not rely on `onEnable`
+alone: it also runs at boot, when the host re-enables the plugin before any session engine is up, so an
+engine read there fails (no active engine, or one still initializing) and a session linked later is never
+covered. No `ctx` capability lists sessions or reports their status, so in `onEnable` try only the
+session ids the plugin already knows (its `manifest.sessions` list or its own config) and leave any whose
+engine read fails (no active engine, or one not yet ready) to its `session:ready` hook.
+Record a per-session marker in `ctx.storage` (which needs the `storage:use` permission) when that
+session's backfill finishes, and skip a session whose marker is set, so a restart resumes an interrupted
+backfill and does not repeat a finished one. Keep an in-memory set of sessions whose backfill is running
+too, so a repeated `session:ready` (a reconnect) does not start a second walk alongside the first. The
+built-in DB-FTS provider is unaffected (its index is DB-synced via triggers on every insert, including
+backfill).
 
 ## 27.4 Host-side guarantees (the plugin author doesn't handle these)
 
@@ -282,6 +304,10 @@ ctx interface is planned; for now the search contract types above are the stable
   `query.sessionIds` — the plugin should honor it (filter by `sessionIds` in the backend query) for
   correct results + performance. The host re-filters as defense-in-depth, but a plugin that ignores
   `sessionIds` returns more rows than needed (wasteful) and relies on the host to strip them.
+- **Chat-restricted keys require the built-in provider.** Plugin search returns `403` before invoking
+  the worker for these keys. Filtering a plugin's returned page cannot enforce scoped offsets or
+  counts. Use `SEARCH_PROVIDER=builtin-fts` to enable search for chat-restricted keys. A compiled
+  chat scope with no valid ids returns no hits and a zero total without invoking the worker.
 - **`message:persisted` is fire-and-forget.** An error in the indexing handler is swallowed (it must not
   break the send/receive pipeline). Log errors via `ctx.logger` and retry/mirror in your backend's own
   retry queue if you need stronger delivery guarantees.

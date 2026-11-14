@@ -35,6 +35,7 @@ export function mapEngineHistoryMessage(h: EngineHistoryMessage): ChatMessage {
       }
       if (h.quotedMessage) metadata.quotedMessage = h.quotedMessage;
       if (h.call) metadata.call = h.call;
+      if (h.poll) metadata.poll = h.poll;
       return Object.keys(metadata).length > 0 ? metadata : undefined;
     })(),
   };
@@ -49,14 +50,20 @@ const msgTime = (m: ChatMessage): number =>
 // real delivery status survives. Deduped by the wweb.js serialized id (engine `id` == DB `waMessageId`).
 export function mergeChatMessages(db: ChatMessage[], history: ChatMessage[]): ChatMessage[] {
   const byId = new Map<string, ChatMessage>();
-  for (const m of history) byId.set(msgKey(m), m);
-  for (const m of db) {
+  for (const m of [...history, ...db]) {
     const key = msgKey(m);
     const hist = byId.get(key);
     // The DB copy wins (authoritative status) — but a legacy row has no stable sender id, so
     // salvage the engine-history copy's author or two same-named participants collapse into one
     // attribution run in the chat view.
-    byId.set(key, hist?.author && !m.author ? { ...m, author: hist.author } : m);
+    let merged = hist?.author && !m.author ? { ...m, author: hist.author } : m;
+    if (m.type === 'poll' && !m.metadata?.poll && hist?.metadata?.poll) {
+      merged = { ...merged, metadata: { ...merged.metadata, poll: hist.metadata.poll } };
+    }
+    if (m.type === 'revoked' || hist?.type === 'revoked') {
+      merged = { ...merged, type: 'revoked', body: '', metadata: undefined };
+    }
+    byId.set(key, merged);
   }
   const sorted = [...byId.values()].sort((a, b) => msgTime(a) - msgTime(b) || a.createdAt.localeCompare(b.createdAt));
   return capMediaPayloads(sorted);
@@ -67,7 +74,7 @@ export function mergeChatMessages(db: ChatMessage[], history: ChatMessage[]): Ch
  * React Query cache with staleTime: Infinity, so every image/video/voice note that arrives while
  * the chat is open would otherwise pin its full base64 string in heap for the whole session —
  * scrolling through a media-rich chat grows the tab unboundedly. Past the cap the OLDEST
- * payloads are stripped to the omitted marker ({data: undefined, omitted: true}), which renders
+ * payloads and archived previews are replaced by the omitted marker, which renders
  * the same 📎 placeholder as a history row fetched without media; the newest `keep` stay
  * renderable (thread + lightbox). Count-based (not byte-based): payloads are bounded upstream
  * by the backend's media size cap.
@@ -87,17 +94,25 @@ export const MEDIA_PAYLOAD_CACHE_LIMIT = 100;
  */
 export function capMediaPayloads(list: ChatMessageView[], keep = MEDIA_PAYLOAD_CACHE_LIMIT): ChatMessageView[] {
   let payloadCount = 0;
-  for (const m of list) if (m.metadata?.media?.data) payloadCount++;
+  const retainsMedia = (message: ChatMessageView): boolean => {
+    const media = message.metadata?.media;
+    // An archived marker previews only while its copy exists (mediaPath, as ChatThread checks); retention nulls it.
+    return Boolean(
+      media?.data ||
+      (media?.archived && message.mediaPath && HISTORY_MEDIA_TYPES.has(message.type) && message.type !== 'document'),
+    );
+  };
+  for (const m of list) if (retainsMedia(m)) payloadCount++;
   if (payloadCount <= keep) return list;
 
   const next = list.slice();
   let toStrip = payloadCount - keep;
   for (let i = 0; i < next.length && toStrip > 0; i++) {
     const media = next[i].metadata?.media;
-    if (!media?.data) continue;
+    if (!media || !retainsMedia(next[i])) continue;
     next[i] = {
       ...next[i],
-      metadata: { ...next[i].metadata, media: { ...media, data: undefined, omitted: true } },
+      metadata: { ...next[i].metadata, media: { ...media, data: undefined, archived: undefined, omitted: true } },
     };
     toStrip--;
   }
@@ -216,6 +231,11 @@ export type MessageMedia = {
   data?: string;
   omitted?: boolean;
   sizeBytes?: number;
+  /**
+   * Set alongside `omitted` when MESSAGE_INLINE_MEDIA=archive dropped the inline copy because the
+   * chat-media archive holds the bytes, the media route serves them, so the thread previews inline.
+   */
+  archived?: boolean;
 };
 
 export const getMediaSrc = (media?: MessageMedia): string => {
@@ -231,28 +251,35 @@ export interface ChatMessageView extends ChatMessage {
     media?: MessageMedia;
     quotedMessage?: { id: string; body: string };
     reactions?: Record<string, string>;
+    edited?: boolean;
     call?: { video: boolean; missed: boolean };
     buttons?: Array<{ id: string; text: string }>;
+    poll?: { name: string; options: string[]; allowMultipleAnswers: boolean };
   };
 }
 
 /**
  * Metadata for a live `message.received` / `message.sent` WS payload. Prompt `buttons` arrive
  * top-level on that event (the history route never populates them) and are folded here so the
- * thread renders from `metadata.buttons`, matching persisted DB rows.
+ * thread renders from `metadata.buttons`, matching persisted DB rows. So is `edited`, set on a
+ * message edited before the gateway stored it, whose `message.edited` came while no thread held it.
  */
 export function liveMessageMetadata(msg: {
   media?: MessageMedia;
   quotedMessage?: { id: string; body: string };
   call?: { video: boolean; missed: boolean };
   buttons?: Array<{ id: string; text: string }>;
+  poll?: { name: string; options: string[]; allowMultipleAnswers: boolean };
+  edited?: boolean;
   metadata?: ChatMessageView['metadata'];
 }): ChatMessageView['metadata'] {
-  if (msg.metadata) return msg.metadata;
+  if (msg.metadata) return msg.edited ? { ...msg.metadata, edited: true } : msg.metadata;
   const metadata: NonNullable<ChatMessageView['metadata']> = {};
+  if (msg.edited) metadata.edited = true;
   if (msg.media) metadata.media = msg.media;
   if (msg.quotedMessage) metadata.quotedMessage = msg.quotedMessage;
   if (msg.call) metadata.call = msg.call;
+  if (msg.poll) metadata.poll = msg.poll;
   if (msg.buttons?.length) metadata.buttons = msg.buttons;
   return Object.keys(metadata).length > 0 ? metadata : undefined;
 }
@@ -315,6 +342,7 @@ function mergeMessageMetadata(
     return incoming.media;
   })();
   const merged: NonNullable<ChatMessageView['metadata']> = {};
+  if (existing.edited || incoming.edited) merged.edited = true;
   if (media) merged.media = media;
   const quotedMessage = incoming.quotedMessage ?? existing.quotedMessage;
   if (quotedMessage) merged.quotedMessage = quotedMessage;
@@ -324,6 +352,8 @@ function mergeMessageMetadata(
   if (call) merged.call = call;
   const buttons = incoming.buttons ?? existing.buttons;
   if (buttons?.length) merged.buttons = buttons;
+  const poll = incoming.poll ?? existing.poll;
+  if (poll) merged.poll = poll;
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
@@ -342,7 +372,10 @@ function mergeMessageMetadata(
  */
 export function mergeOrAppend(list: ChatMessageView[], incoming: ChatMessageView): ChatMessageView[] {
   const idx = list.findIndex(m => msgKey(m) === msgKey(incoming));
-  if (idx === -1) return capMediaPayloads([...list, incoming]);
+  if (idx === -1) {
+    const message = incoming.type === 'revoked' ? { ...incoming, body: '', metadata: undefined } : incoming;
+    return capMediaPayloads([...list, message]);
+  }
   const existing = list[idx];
   const next = list.slice();
   next[idx] = {
@@ -352,6 +385,9 @@ export function mergeOrAppend(list: ChatMessageView[], incoming: ChatMessageView
     status: mergeDeliveryStatus(existing.status, incoming.status) ?? incoming.status,
     metadata: mergeMessageMetadata(existing.metadata, incoming.metadata),
   };
+  if (existing.type === 'revoked' || incoming.type === 'revoked') {
+    next[idx] = { ...next[idx], type: 'revoked', body: '', metadata: undefined };
+  }
   return capMediaPayloads(next);
 }
 
@@ -431,7 +467,8 @@ export function findRevokedIndex(list: ChatMessageView[], event: { id: string; r
 /**
  * Replace the displayed body of a cached WhatsApp message after a `message.edited` event. Both id
  * candidates are matched, for the reason given on findRevokedIndex. Returns the original array on
- * a miss.
+ * a miss, and when the event repeats the text the message already has: the gateway announces such an
+ * event but stores no edited marker for it, so labelling it here would show what a reload does not.
  */
 export function applyMessageEdit(
   list: ChatMessageView[],
@@ -439,8 +476,28 @@ export function applyMessageEdit(
 ): ChatMessageView[] {
   if (!event.messageId) return list;
   const idx = list.findIndex(byMessageId(event.messageId));
-  if (idx === -1) return list;
+  if (idx === -1 || list[idx].type === 'revoked' || list[idx].body === event.body) return list;
   const next = list.slice();
-  next[idx] = { ...next[idx], body: event.body };
+  next[idx] = { ...next[idx], body: event.body, metadata: { ...next[idx].metadata, edited: true } };
   return next;
+}
+
+/**
+ * The ids a read of a chat should name on an engine that acknowledges messages one by one: the incoming messages
+ * of the thread that no read has acknowledged yet, at most `max` of the newest, oldest first. An id the gateway
+ * would refuse (whitespace, or longer than 128 characters) is left out, since one of them fails the whole read.
+ */
+export function unacknowledgedIncomingIds(
+  thread: ChatMessageView[],
+  acknowledged: ReadonlySet<string>,
+  max: number,
+): string[] {
+  const ids: string[] = [];
+  for (let i = thread.length - 1; i >= 0 && ids.length < max; i--) {
+    const { direction, waMessageId } = thread[i];
+    if (direction === 'incoming' && waMessageId && /^\S{1,128}$/.test(waMessageId) && !acknowledged.has(waMessageId)) {
+      ids.push(waMessageId);
+    }
+  }
+  return ids.reverse();
 }

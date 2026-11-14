@@ -4,6 +4,7 @@ import { ServiceUnavailableException, UnauthorizedException } from '@nestjs/comm
 import { ConfigService } from '@nestjs/config';
 import { Request } from 'express';
 import { HealthController } from './health.controller';
+import { ReadinessResponseDto } from './dto/health-response.dto';
 import { ShutdownService } from '../../common/services/shutdown.service';
 import { AuthService } from '../auth/auth.service';
 import { AuditService } from '../audit/audit.service';
@@ -18,7 +19,7 @@ describe('HealthController', () => {
   const logWarn = jest.fn().mockResolvedValue(null);
 
   const reqWith = (headers: Record<string, string> = {}, ip = '127.0.0.1'): Request =>
-    ({ headers, socket: { remoteAddress: ip } }) as unknown as Request;
+    ({ method: 'GET', path: '/api/health', headers, socket: { remoteAddress: ip } }) as unknown as Request;
 
   beforeEach(async () => {
     mainQuery.mockResolvedValue([{ '1': 1 }]);
@@ -112,8 +113,8 @@ describe('HealthController', () => {
       expect(result).not.toHaveProperty('version');
       expect(logWarn).toHaveBeenCalledWith(AuditAction.API_KEY_AUTH_FAILED, {
         ipAddress: '127.0.0.1',
-        method: undefined,
-        path: undefined,
+        method: 'GET',
+        path: '/api/health',
         errorMessage: 'Invalid API key',
       });
     });
@@ -225,21 +226,143 @@ describe('HealthController', () => {
       expect(dataQuery).toHaveBeenCalledWith('SELECT 1');
     });
 
+    /** Runs readiness() and returns the 503 body it threw. */
+    const unavailableBody = async (pending: Promise<unknown> = controller.readiness()) => {
+      const err: unknown = await pending.catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ServiceUnavailableException);
+      return (err as ServiceUnavailableException).getResponse();
+    };
+
     it('throws 503 when the data database is down', async () => {
       dataQuery.mockRejectedValue(new Error('connection refused'));
-      await expect(controller.readiness()).rejects.toBeInstanceOf(ServiceUnavailableException);
+      expect(await unavailableBody()).toEqual({
+        status: 'error',
+        details: { mainDatabase: { status: 'up' }, dataDatabase: { status: 'down' } },
+      });
     });
 
     it('throws 503 when the main (auth/audit) database is down', async () => {
       mainQuery.mockRejectedValue(new Error('disk I/O error'));
-      await expect(controller.readiness()).rejects.toBeInstanceOf(ServiceUnavailableException);
+      expect(await unavailableBody()).toEqual({
+        status: 'error',
+        details: { mainDatabase: { status: 'down' }, dataDatabase: { status: 'up' } },
+      });
+    });
+
+    it('reports a database whose probe hangs as down after 3 s instead of stalling', async () => {
+      jest.useFakeTimers();
+      try {
+        mainQuery.mockReturnValue(new Promise(() => {}));
+        const pending = unavailableBody();
+        await jest.advanceTimersByTimeAsync(3000);
+        expect(await pending).toEqual({
+          status: 'error',
+          details: { mainDatabase: { status: 'down' }, dataDatabase: { status: 'up' } },
+        });
+      } finally {
+        jest.useRealTimers();
+      }
     });
 
     it('throws 503 while draining, without even probing the DBs', async () => {
       isShuttingDown.mockReturnValue(true);
-      await expect(controller.readiness()).rejects.toBeInstanceOf(ServiceUnavailableException);
+      expect(await unavailableBody()).toEqual({ status: 'error', details: { shutdown: { status: 'draining' } } });
       expect(mainQuery).not.toHaveBeenCalled();
       expect(dataQuery).not.toHaveBeenCalled();
+    });
+
+    // The route is public and exempt from the throttler, so a burst of callers must not become a burst of queries.
+    describe('under a burst of probes', () => {
+      afterEach(() => jest.useRealTimers());
+
+      it('shares one pair of probes between requests that arrive together', async () => {
+        const results = await Promise.all([controller.readiness(), controller.readiness(), controller.readiness()]);
+
+        expect(results.map(result => result.status)).toEqual(['ok', 'ok', 'ok']);
+        expect(mainQuery).toHaveBeenCalledTimes(1);
+        expect(dataQuery).toHaveBeenCalledTimes(1);
+      });
+
+      it('answers from the last verdict for a second, then probes again', async () => {
+        jest.useFakeTimers();
+        await controller.readiness();
+        await controller.readiness();
+        expect(mainQuery).toHaveBeenCalledTimes(1);
+
+        jest.advanceTimersByTime(999);
+        await controller.readiness();
+        expect(mainQuery).toHaveBeenCalledTimes(1);
+
+        jest.advanceTimersByTime(2);
+        await controller.readiness();
+        expect(mainQuery).toHaveBeenCalledTimes(2);
+        expect(dataQuery).toHaveBeenCalledTimes(2);
+      });
+
+      it('reuses a down verdict for the same second, and recovers once it expires', async () => {
+        jest.useFakeTimers();
+        mainQuery.mockRejectedValueOnce(new Error('connection refused'));
+        expect(await unavailableBody()).toEqual({
+          status: 'error',
+          details: { mainDatabase: { status: 'down' }, dataDatabase: { status: 'up' } },
+        });
+
+        expect(await unavailableBody()).toEqual({
+          status: 'error',
+          details: { mainDatabase: { status: 'down' }, dataDatabase: { status: 'up' } },
+        });
+        expect(mainQuery).toHaveBeenCalledTimes(1);
+
+        jest.advanceTimersByTime(1000);
+        expect((await controller.readiness()).status).toBe('ok');
+        expect(mainQuery).toHaveBeenCalledTimes(2);
+      });
+
+      it('probes again when the clock was set back past the verdict it kept', async () => {
+        jest.useFakeTimers();
+        await controller.readiness();
+
+        jest.setSystemTime(Date.now() - 60_000);
+        await controller.readiness();
+
+        expect(mainQuery).toHaveBeenCalledTimes(2);
+      });
+
+      it('reports draining at once, never from a verdict it kept', async () => {
+        await controller.readiness();
+        isShuttingDown.mockReturnValue(true);
+
+        expect(await unavailableBody()).toEqual({ status: 'error', details: { shutdown: { status: 'draining' } } });
+        expect(mainQuery).toHaveBeenCalledTimes(1);
+      });
+
+      it('tells every waiter that a probe which hangs is down after 3 s', async () => {
+        jest.useFakeTimers();
+        mainQuery.mockReturnValue(new Promise(() => {}));
+        const first = unavailableBody();
+        const second = unavailableBody();
+
+        await jest.advanceTimersByTimeAsync(3000);
+
+        const expected = {
+          status: 'error',
+          details: { mainDatabase: { status: 'down' }, dataDatabase: { status: 'up' } },
+        };
+        expect(await first).toEqual(expected);
+        expect(await second).toEqual(expected);
+        expect(mainQuery).toHaveBeenCalledTimes(1);
+      });
+    });
+
+    // The draining 503 answers while every database is up, so the contract must not describe the
+    // status as a dependency outage only.
+    it('documents both 503 causes with the readiness body shape', () => {
+      const responses = Reflect.getMetadata(
+        'swagger/apiResponse',
+        Object.getOwnPropertyDescriptor(HealthController.prototype, 'readiness')?.value as object,
+      ) as Record<string, { description: string; type?: unknown }>;
+      expect(responses['503'].description).toContain('draining');
+      expect(responses['503'].type).toBe(ReadinessResponseDto);
     });
   });
 });

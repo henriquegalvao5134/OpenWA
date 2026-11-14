@@ -27,4 +27,20 @@ public record WebhookDeliveryFailure(
     Integer lastStatusCode,
     String lastError,
     /** ISO timestamp of when the failure was recorded. */
-    String createdAt) {}
+    String createdAt,
+    /**
+     * True when the row still holds the event data and its webhook still exists in the same session: a
+     * terminal row (attempts &gt; 0) recorded while the gateway's WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS
+     * is above 0, until that window passes. {@code redriveDeliveryFailures} replays it while that webhook
+     * is active and subscribed to the event.
+     */
+    boolean replayable) {
+    /** Preserve construction by clients compiled against the response before replay support. */
+    public WebhookDeliveryFailure(
+        String id, String webhookId, String sessionId, String event, String url,
+        String idempotencyKey, String deliveryId, int attempts, Integer lastStatusCode,
+        String lastError, String createdAt) {
+        this(id, webhookId, sessionId, event, url, idempotencyKey, deliveryId,
+            attempts, lastStatusCode, lastError, createdAt, false);
+    }
+}

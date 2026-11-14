@@ -1,14 +1,13 @@
 import { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Eye, EyeOff, Languages } from 'lucide-react';
-import { GithubIcon } from '../components/GithubIcon';
 import { CustomSelect } from '../components/CustomSelect';
 import { languageOptions, resolveSupportedLanguage, type SupportedLanguage } from '../i18n';
 import { API_BASE_URL } from '../services/api';
 import './Login.css';
 
 interface LoginProps {
-  onLogin: (apiKey: string, role?: string, engineType?: string) => void;
+  onLogin: (apiKey: string, role?: string, engineType?: string, scoped?: boolean) => void;
 }
 
 export function Login({ onLogin }: LoginProps) {
@@ -46,11 +45,27 @@ export function Login({ onLogin }: LoginProps) {
       if (response.ok) {
         // The validate body already carries the key's role — hand it up so the app can set it
         // directly instead of re-validating the same key a second time.
-        const data: { role?: string; engineType?: string } = await response.json().catch(() => ({}));
-        onLogin(key, data.role, typeof data.engineType === 'string' ? data.engineType : undefined);
+        const data: { valid?: unknown; role?: string; engineType?: string; scoped?: unknown } = await response
+          .json()
+          .catch(() => ({}));
+        // A 200 is the gateway's answer only if it says the key is valid, as the startup check requires: a reverse proxy
+        // serving the app's HTML for a misrouted /api would otherwise sign any typed text in as a viewer.
+        if (data.valid !== true) {
+          setError(t('login.connectionError'));
+          return;
+        }
+        onLogin(
+          key,
+          data.role,
+          typeof data.engineType === 'string' ? data.engineType : undefined,
+          data.scoped === true,
+        );
       } else {
-        const errorData = await response.json().catch(() => ({}));
-        setError(errorData.message || t('login.invalidKey'));
+        // A 5xx, or a body that is not the gateway's JSON (a proxy error page while it restarts), says
+        // nothing about the key; a refusal keeps the gateway's reason (expired, revoked, rate limited).
+        const errorData: { message?: unknown } = await response.json().catch(() => ({}));
+        const reason = response.status < 500 && typeof errorData.message === 'string' ? errorData.message : '';
+        setError(reason || t(response.status === 401 ? 'login.invalidKey' : 'login.connectionError'));
       }
     } catch {
       setError(t('login.connectionError'));
@@ -63,7 +78,9 @@ export function Login({ onLogin }: LoginProps) {
     <div className="login-container">
       <div className="login-card">
         <div className="login-logo">
-          <img src="/openwa_logo.webp" alt="OpenWA" className="logo-icon" />
+          <svg className="logo-icon" viewBox="0 0 80 32" xmlns="http://www.w3.org/2000/svg" aria-label="GD3">
+            <text x="0" y="26" fontFamily="system-ui,-apple-system,sans-serif" fontWeight="700" fontSize="26" fill="currentColor" letterSpacing="-1">GD3</text>
+          </svg>
           <span className="version-info">
             {t('login.version', {
               version: __APP_VERSION__,
@@ -95,6 +112,8 @@ export function Login({ onLogin }: LoginProps) {
                 onChange={e => setApiKey(e.target.value)}
                 placeholder={t('login.apiKeyPlaceholder')}
                 className={error ? 'error' : ''}
+                aria-invalid={error ? true : undefined}
+                aria-describedby={error ? 'apiKey-error' : undefined}
               />
               <button
                 type="button"
@@ -105,7 +124,11 @@ export function Login({ onLogin }: LoginProps) {
                 {showKey ? <EyeOff size={20} /> : <Eye size={20} />}
               </button>
             </div>
-            {error && <span className="error-message">{error}</span>}
+            {error && (
+              <span id="apiKey-error" className="error-message" role="alert">
+                {error}
+              </span>
+            )}
           </div>
 
           <button type="submit" className="connect-btn" disabled={isLoading}>
@@ -113,25 +136,10 @@ export function Login({ onLogin }: LoginProps) {
           </button>
         </form>
 
-        <p className="login-help">
-          {t('login.help')}{' '}
-          <a href="https://docs.open-wa.org" target="_blank" rel="noopener noreferrer">
-            {t('login.viewDocs')}
-          </a>
-        </p>
       </div>
 
       <footer className="login-footer">
         <span>{t('login.footer')}</span>
-        <a
-          href="https://github.com/rmyndharis/OpenWA"
-          target="_blank"
-          rel="noopener noreferrer"
-          className="github-link"
-          aria-label="GitHub"
-        >
-          <GithubIcon size={18} />
-        </a>
       </footer>
     </div>
   );

@@ -7,15 +7,15 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { WebhookProcessor } from './processors/webhook.processor';
 import { IngressProcessor } from './processors/ingress.processor';
 import { QUEUE_NAMES } from './queue-names';
-import { queueConnectionOptions } from './redis-connection';
+import { queueRootOptions } from './redis-connection';
+import { ShutdownSafeQueue } from './shutdown-safe-queue';
 import { Webhook } from '../webhook/entities/webhook.entity';
+import { WebhookOutboxModule } from '../webhook/webhook-outbox.module';
 import { WebhookDeliveryFailure } from '../webhook/entities/webhook-delivery-failure.entity';
 import { IntegrationDeliveryFailure } from '../integration/entities/integration-delivery-failure.entity';
+import { IngressEvent } from '../integration/entities/ingress-event.entity';
 import { HooksModule } from '../../core/hooks/hooks.module';
 import { PluginsModule } from '../../core/plugins/plugins.module';
-
-// Re-export for backward compatibility
-export { QUEUE_NAMES } from './queue-names';
 
 /**
  * Bounded retention for finished webhook-queue jobs. Failed webhook jobs carry their full payload in
@@ -28,18 +28,25 @@ export const WEBHOOK_QUEUE_JOB_OPTIONS = {
   removeOnFail: { age: 86400, count: 5000 },
 } as const;
 
+// Read when registerQueue runs below, so it has to be set before the @Module decorator is evaluated.
+BullModule.queueClass = ShutdownSafeQueue;
+
 @Module({
   imports: [
     // Required for WebhookProcessor to inject Repository<Webhook> + Repository<WebhookDeliveryFailure>;
-    // IngressProcessor to inject Repository<IntegrationDeliveryFailure> (both on the 'data' connection).
-    TypeOrmModule.forFeature([Webhook, WebhookDeliveryFailure, IntegrationDeliveryFailure], 'data'),
+    // IngressProcessor to inject Repository<IntegrationDeliveryFailure> + Repository<IngressEvent> (all on
+    // the 'data' connection).
+    TypeOrmModule.forFeature([Webhook, WebhookDeliveryFailure, IntegrationDeliveryFailure, IngressEvent], 'data'),
+    // Required for WebhookProcessor to inject the one WebhookOutboxService the webhook module also uses.
+    WebhookOutboxModule,
     // Required for WebhookProcessor/IngressProcessor to inject HookManager
     HooksModule,
-    // Required for IngressProcessor to inject PluginLoaderService (already @Global(), imported
-    // explicitly for clarity, matching HooksModule above).
+    // Required for IngressProcessor to inject PluginLoaderService (already @Global()). Imported ahead of
+    // BullModule so the loader's init hook, which marks the plugins being restored, runs before the
+    // workers start (see app.module.ts).
     PluginsModule,
     BullModule.forRootAsync({
-      useFactory: () => ({ connection: queueConnectionOptions() }),
+      useFactory: queueRootOptions,
     }),
     BullModule.registerQueue({
       name: QUEUE_NAMES.WEBHOOK,

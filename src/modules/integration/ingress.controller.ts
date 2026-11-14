@@ -10,7 +10,7 @@ import { InstanceThrottlerGuard } from './instance-throttler.guard';
 // @Public so the global ApiKeyGuard early-returns (providers can't present an API key). The
 // controller-level @SkipThrottle below exempts the GLOBAL per-IP guard (see its comment).
 // The provider body is read as RAW bytes from req.rawBody (stashed by the json() verify callback in
-// main.ts) — it is intentionally NOT DTO-bound, so the global ValidationPipe never 400s on the
+// src/configure-app.ts) — it is intentionally NOT DTO-bound, so the global ValidationPipe never 400s on the
 // provider's unknown keys, and the exact signed bytes reach the HMAC verifier.
 @ApiTags('integration')
 @Public()
@@ -58,7 +58,14 @@ export class IngressController {
   })
   @ApiResponse({
     status: 202,
-    description: 'Webhook accepted and queued for async plugin processing (the primary success path).',
+    description:
+      'Webhook accepted (the primary success path). With the queue on it is queued for async plugin processing. ' +
+      'With the queue off a route without a response contract answers after the plugin ran inline (at most ' +
+      'INGRESS_DISPATCH_TIMEOUT_MS), and a route with one answers first and dispatches inline after.',
+  })
+  @ApiResponse({
+    status: 400,
+    description: 'The path or query contains an encoded NUL (`%00`), or a JSON body does not parse.',
   })
   @ApiResponse({ status: 401, description: 'Signature verification failed (missing, stale, or wrong secret).' })
   @ApiResponse({ status: 403, description: 'GET verification challenge failed (verifyToken mismatch).' })
@@ -76,7 +83,7 @@ export class IngressController {
   @ApiResponse({
     status: 503,
     description:
-      "A route whose response contract declares a `session-alive` preflight, when the bound session's engine is not connected. The delivery is not persisted, so the provider's retry is treated as a new one; `Retry-After` carries the delay.",
+      "A route that declares a response contract, while its plugin is still being restored after startup or when its `session-alive` preflight finds the bound session with no running engine or a failed one (a starting, reconnecting or QR-pending session is answered with the route's ack). The delivery is not persisted, so the provider's retry is treated as a new one; `Retry-After` carries the delay. A route without a response contract is accepted while its plugin restores.",
   })
   async receive(
     @Param('pluginId') pluginId: string,

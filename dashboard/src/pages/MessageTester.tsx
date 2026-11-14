@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, type ChangeEvent } from 'react';
+import { Fragment, useState, useEffect, useMemo, useRef, type ChangeEvent } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Send, CheckCircle, XCircle, Loader2, Upload, X, Plus, AlertCircle } from 'lucide-react';
 import {
@@ -30,8 +30,11 @@ import {
 import { PageHeader } from '../components/PageHeader';
 import { GroupPicker } from '../components/GroupPicker';
 import { groupLabel, isGatewayRefusal, planGroupSend } from '../utils/groupSelection';
+import { normalizePhoneDigits } from '../utils/phone';
 import { sendSequentially } from '../utils/sendSequentially';
+import { keepsSameKey } from '../utils/authLifecycle';
 import './MessageTester.css';
+import { MEDIA_UPLOAD_MAX_BYTES } from '../utils/mediaUpload';
 
 interface ApiResponse {
   success: boolean;
@@ -50,6 +53,7 @@ interface ApiResponse {
     failures: { id: string; name: string; error: string }[];
     notSent: number;
     stoppedBy?: 'abort' | 'refusal';
+    // The status that stopped the run; absent when a fetch got no answer at all.
     refusedWith?: number;
   };
 }
@@ -72,6 +76,16 @@ const messageTypes = [
 
 // The types that share the media upload/URL block (base64 XOR url + mimetype).
 const mediaMessageTypes: readonly string[] = ['image', 'video', 'audio', 'document', 'sticker'];
+
+// The gateway's @MaxLength bounds on the single-send bodies. A multi-group send repeats one body per group,
+// so a body over any of them would be refused once per group.
+const MESSAGE_TEXT_MAX_LENGTH = 4096;
+const MEDIA_FILENAME_MAX_LENGTH = 255;
+const LOCATION_TEXT_MAX_LENGTH = 1024;
+const CONTACT_NAME_MAX_LENGTH = 255;
+const CONTACT_NUMBER_MAX_LENGTH = 30;
+const POLL_NAME_MAX_LENGTH = 255;
+const POLL_OPTION_MAX_LENGTH = 100;
 
 // Hint the native file picker at the right category (documents accept anything).
 const mediaAccept: Record<(typeof messageTypes)[number], string> = {
@@ -104,14 +118,22 @@ const fallbackMime: Record<(typeof messageTypes)[number], string> = {
   bulk: 'application/octet-stream',
 };
 
-// Client pre-check before base64-encoding an upload. Aligned with the default request-body limit: base64
-// inflates ~1.33x, so ~18 MiB raw stays under the 25 MiB BODY_SIZE_LIMIT and lets the backend reject with a
-// clear 413 instead of the tab OOMing on a multi-hundred-MB pick before the request is even sent. The
-// backend's MEDIA_DOWNLOAD_MAX_BYTES (default 50 MiB) stays authoritative for URL sends (fetched server-side).
-const MEDIA_UPLOAD_MAX_BYTES = 18 * 1024 * 1024;
-
 // Batch statuses that stop the progress polling (mirrors the backend BatchStatus enum).
 const TERMINAL_BATCH_STATUSES: readonly BatchStatus[] = ['completed', 'cancelled', 'failed'];
+
+// The digits of a typed number for the number check, or null past the longest phone number (E.164, 15 digits). A space
+// is number formatting, so two numbers pasted with one between them read as one run, which is no number to look up.
+// A leading 00 is the international exit code (no number starts with 0): dropped before measuring, as the Number
+// Checker drops it.
+const PHONE_DIGITS_MAX = 15;
+// Whether a recipient field names anything: a digit to look up once the exit code is dropped, or an @ of a chat id as
+// typed, which is how the send reads it. With neither, the number check went out as GET .../contacts/check/, which the
+// gateway routes to the contact read of the id "check".
+const namesRecipient = (text: string): boolean => text.includes('@') || normalizePhoneDigits(text) !== '';
+const phoneDigits = (text: string): string | null => {
+  const digits = normalizePhoneDigits(text);
+  return digits.length > PHONE_DIGITS_MAX ? null : digits;
+};
 
 export function MessageTester() {
   const { t } = useTranslation();
@@ -207,10 +229,12 @@ export function MessageTester() {
   // in flight at unmount resolves later, so startBatchPolling must refuse to start once unmounted.
   // Reset on every mount: StrictMode runs mount, unmount, mount.
   const unmountedRef = useRef(false);
+  const sendGenerationRef = useRef(0);
   useEffect(() => {
     unmountedRef.current = false;
     return () => {
       unmountedRef.current = true;
+      sendGenerationRef.current += 1;
       stopBatchPolling();
     };
   }, []);
@@ -321,7 +345,7 @@ export function MessageTester() {
   };
 
   const isMediaMessageType = mediaMessageTypes.includes(messageType);
-  const bulkRecipientList = parseBulkRecipients(bulkRecipients);
+  const bulkRecipientList = useMemo(() => parseBulkRecipients(bulkRecipients), [bulkRecipients]);
   const pollOptionsFilled = pollOptions.map(o => o.trim()).filter(o => o.length > 0);
   const lat = parseFloat(latitude);
   const lng = parseFloat(longitude);
@@ -331,40 +355,71 @@ export function MessageTester() {
     messageType === 'bulk' &&
     !!mediaFile &&
     mediaFile.base64.length * bulkRecipientList.length > BULK_INLINE_MEDIA_MAX_BYTES;
-  const bulkMediaUrlInvalid =
-    messageType === 'bulk' && !mediaFile && mediaUrl.trim() !== '' && !isHttpMediaUrl(mediaUrl);
+  // The gateway reads a media string as a URL only with an http(s) prefix and decodes anything else as
+  // base64, so a URL without one is refused (or sent as garbage bytes) for every recipient alike.
+  const mediaUrlInvalid = !mediaFile && mediaUrl.trim() !== '' && !isHttpMediaUrl(mediaUrl);
   // Audio goes out without a caption (the bulk service does not forward one), so text next to an audio
   // attachment would be dropped while the batch reports success. Refuse it instead of sending half.
   const bulkAudioWithText = bulkAttachment?.kind === 'audio' && content.trim().length > 0;
   const bulkCaptionTooLong =
     bulkAttachment !== null && bulkAttachment.kind !== 'audio' && captionLength(content) > BULK_CAPTION_MAX_LENGTH;
+  // Without an attachment every item is a text message, under the same bound as a single text send.
+  const bulkTextTooLong = bulkAttachment === null && captionLength(content) > MESSAGE_TEXT_MAX_LENGTH;
+
+  // The text field goes out as the caption on image and video and as the filename on a document.
+  const mediaContentMax =
+    messageType === 'document'
+      ? MEDIA_FILENAME_MAX_LENGTH
+      : messageType === 'image' || messageType === 'video'
+        ? BULK_CAPTION_MAX_LENGTH
+        : Infinity;
 
   // Per-type required-field validation (the backend stays the authoritative validator). A multi-group
   // send repeats the request per group, so a body the backend would refuse must not start the run.
   let formValid = true;
   if (messageType === 'text') {
-    formValid = content.trim().length > 0;
+    formValid = content.trim().length > 0 && captionLength(content) <= MESSAGE_TEXT_MAX_LENGTH;
   } else if (isMediaMessageType) {
-    formValid = !!mediaFile || mediaUrl.trim().length > 0;
+    formValid = (!!mediaFile || isHttpMediaUrl(mediaUrl)) && captionLength(content) <= mediaContentMax;
   } else if (messageType === 'location') {
-    formValid = !Number.isNaN(lat) && !Number.isNaN(lng) && lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180;
+    formValid =
+      !Number.isNaN(lat) &&
+      !Number.isNaN(lng) &&
+      lat >= -90 &&
+      lat <= 90 &&
+      lng >= -180 &&
+      lng <= 180 &&
+      captionLength(locationDescription.trim()) <= LOCATION_TEXT_MAX_LENGTH &&
+      captionLength(locationAddress.trim()) <= LOCATION_TEXT_MAX_LENGTH;
   } else if (messageType === 'contact') {
-    formValid = contactName.trim().length > 0 && contactNumber.trim().length > 0;
+    formValid =
+      contactName.trim().length > 0 &&
+      captionLength(contactName.trim()) <= CONTACT_NAME_MAX_LENGTH &&
+      contactNumber.trim().length > 0 &&
+      captionLength(contactNumber.trim()) <= CONTACT_NUMBER_MAX_LENGTH;
   } else if (messageType === 'poll') {
-    formValid = pollQuestion.trim().length > 0 && pollOptionsFilled.length >= 2;
+    formValid =
+      pollQuestion.trim().length > 0 &&
+      captionLength(pollQuestion.trim()) <= POLL_NAME_MAX_LENGTH &&
+      pollOptionsFilled.length >= 2 &&
+      pollOptionsFilled.every(option => captionLength(option) <= POLL_OPTION_MAX_LENGTH);
   } else if (messageType === 'forward') {
-    formValid = forwardTo.trim().length > 0 && forwardMessageId.trim().length > 0;
+    formValid = namesRecipient(forwardTo) && forwardMessageId.trim().length > 0;
   } else if (messageType === 'bulk') {
     formValid =
       (content.trim().length > 0 || bulkAttachment !== null) &&
       !bulkMediaTooLarge &&
-      !bulkMediaUrlInvalid &&
+      !mediaUrlInvalid &&
       !bulkAudioWithText &&
       !bulkCaptionTooLong &&
+      !bulkTextTooLong &&
       bulkRecipientList.length > 0 &&
       bulkRecipientList.length <= BULK_MAX_RECIPIENTS &&
       (delayMs === undefined || (!Number.isNaN(delayMs) && delayMs >= 1000 && delayMs <= 60000));
   }
+
+  // A personal recipient is only the default chat a forward is taken from, so a forward from a named chat uses none.
+  const recipientUnused = messageType === 'forward' && recipientType !== 'group' && forwardFrom.trim().length > 0;
 
   // A new send replaces the batch on screen, so it waits for an in-flight cancel: the cancel's answer
   // would otherwise be merged into the newer batch and stop its progress polling.
@@ -374,11 +429,27 @@ export function MessageTester() {
     batchCancelling ||
     !session ||
     !formValid ||
-    (messageType !== 'bulk' && (recipientType === 'group' ? selectedGroups.length === 0 : !recipient));
+    (messageType !== 'bulk' &&
+      !recipientUnused &&
+      (recipientType === 'group' ? selectedGroups.length === 0 : !namesRecipient(recipient)));
+
+  // Says why Send is held when a field runs past its bound, counted the way `formValid` counts it.
+  const tooLongHint = (value: string, max: number) => {
+    const count = captionLength(value);
+    return (
+      <span className="hint error" role="status">
+        {count > max ? t('common.fieldTooLong', { max, count }) : ''}
+      </span>
+    );
+  };
 
   const isGroupSending = groupSendProgress !== null;
 
-  const sendToGroups = async (chatIds: string[], sendTo: (chatId: string) => Promise<MessageResponse>) => {
+  const sendToGroups = async (
+    chatIds: string[],
+    sendTo: (chatId: string) => Promise<MessageResponse>,
+    isCurrent: () => boolean,
+  ) => {
     const controller = new AbortController();
     groupSendAbort.current = controller;
     const labels = new Map(groups.map(group => [group.id, groupLabel(group)]));
@@ -387,15 +458,18 @@ export function MessageTester() {
         chatIds,
         async chatId => {
           const result = await sendTo(chatId);
-          if (!result.messageId) throw new Error(t('messageTester.sendFailed'));
+          if (typeof result.messageId !== 'string') throw new Error(t('messageTester.sendFailed'));
         },
         {
           delayMs: GROUP_SEND_DELAY_MS,
           signal: controller.signal,
           stopOn: isGatewayRefusal,
-          onProgress: (current, total) => setGroupSendProgress({ current, total }),
+          onProgress: (current, total) => {
+            if (isCurrent()) setGroupSendProgress({ current, total });
+          },
         },
       );
+      if (!isCurrent()) return;
       setResponse({
         success: outcome.sent === chatIds.length,
         timestamp: new Date().toISOString(),
@@ -413,9 +487,13 @@ export function MessageTester() {
         },
       });
     } finally {
-      groupSendAbort.current = null;
-      setGroupSendProgress(null);
-      setGroupSendCancelling(false);
+      if (groupSendAbort.current === controller) {
+        groupSendAbort.current = null;
+        if (!unmountedRef.current) {
+          setGroupSendProgress(null);
+          setGroupSendCancelling(false);
+        }
+      }
     }
   };
 
@@ -426,7 +504,16 @@ export function MessageTester() {
 
   const handleSend = async () => {
     const targetId = recipientType === 'group' ? (selectedGroups[0] ?? '') : recipient;
-    if (!session || (messageType !== 'bulk' && !targetId)) return;
+    if (!session || (messageType !== 'bulk' && !targetId && !recipientUnused)) return;
+    const generation = ++sendGenerationRef.current;
+    const sameKey = keepsSameKey();
+    const isCurrent = () => !unmountedRef.current && generation === sendGenerationRef.current && sameKey();
+    const assertCurrent = () => {
+      if (!isCurrent()) {
+        groupSendAbort.current?.abort();
+        throw new DOMException('Aborted', 'AbortError');
+      }
+    };
     setIsLoading(true);
     setResponse(null);
     // An earlier batch keeps running server-side, but its polling must not overwrite this response.
@@ -439,13 +526,22 @@ export function MessageTester() {
       // than hand-building an engine-specific JID here (#265) — also surfaces unregistered numbers.
       // Bulk carries its own recipient list, so the shared selector's target is not resolved there.
       let chatId = targetId;
-      if (messageType !== 'bulk' && recipientType !== 'group') {
-        const resolved = await contactApi.checkNumber(session, targetId.replace(/[^0-9]/g, ''));
-        if (!resolved.exists || !resolved.whatsappId) {
+      // A chat id (anything with an @, such as a lid copied from Chats) goes out as it is, like a forward target: read
+      // as a number it loses its meaning, a lid's digits being no phone and a device suffix joining the phone's digits.
+      if (messageType !== 'bulk' && recipientType !== 'group' && targetId.includes('@')) {
+        chatId = targetId.trim();
+      } else if (messageType !== 'bulk' && recipientType !== 'group' && !recipientUnused) {
+        const digits = phoneDigits(targetId);
+        const resolved = digits === null ? null : await contactApi.checkNumber(session, digits);
+        assertCurrent();
+        if (!resolved?.exists || !resolved.whatsappId) {
           setResponse({
             success: false,
             timestamp: new Date().toISOString(),
-            error: t('messageTester.notOnWhatsApp'),
+            error:
+              digits === null
+                ? t('messageTester.tooLong', { max: PHONE_DIGITS_MAX })
+                : t('messageTester.notOnWhatsApp'),
           });
           return;
         }
@@ -458,6 +554,7 @@ export function MessageTester() {
           messages: buildBulkMessages(bulkRecipientList, content, bulkAttachment),
           ...(delayMs !== undefined ? { options: { delayBetweenMessages: delayMs } } : {}),
         });
+        assertCurrent();
         batchSessionRef.current = session;
         setResponse({ success: true, timestamp: new Date().toISOString(), batchId: batch.batchId });
         setBatchStatus({
@@ -471,6 +568,7 @@ export function MessageTester() {
       }
 
       const sendTo = async (target: string): Promise<MessageResponse> => {
+        assertCurrent();
         switch (messageType) {
           case 'text':
             return messageApi.sendText(session, target, content);
@@ -482,7 +580,7 @@ export function MessageTester() {
             // backend accepts url XOR base64 and requires a mimetype for base64 (always provided here).
             const payload: SendMediaPayload = mediaFile
               ? { base64: mediaFile.base64, mimetype: mediaFile.mimetype }
-              : { url: mediaUrl };
+              : { url: mediaUrl.trim() };
             if ((messageType === 'image' || messageType === 'video') && content) payload.caption = content;
             if (messageType === 'document' && content) payload.filename = content;
             return messageApi.sendMedia(session, target, messageType, payload);
@@ -490,7 +588,7 @@ export function MessageTester() {
           case 'sticker': {
             const payload: SendMediaPayload = mediaFile
               ? { base64: mediaFile.base64, mimetype: mediaFile.mimetype }
-              : { url: mediaUrl };
+              : { url: mediaUrl.trim() };
             return messageApi.sendSticker(session, target, payload);
           }
           case 'location':
@@ -519,7 +617,10 @@ export function MessageTester() {
             // through the same check-number flow as the main recipient.
             let toChatId = forwardTo.trim();
             if (!toChatId.includes('@')) {
-              const resolvedTo = await contactApi.checkNumber(session, toChatId.replace(/[^0-9]/g, ''));
+              const digits = phoneDigits(toChatId);
+              if (digits === null) throw new Error(t('messageTester.tooLong', { max: PHONE_DIGITS_MAX }));
+              const resolvedTo = await contactApi.checkNumber(session, digits);
+              assertCurrent();
               if (!resolvedTo.exists || !resolvedTo.whatsappId) throw new Error(t('messageTester.notOnWhatsApp'));
               toChatId = resolvedTo.whatsappId;
             }
@@ -537,18 +638,20 @@ export function MessageTester() {
 
       const plan = recipientType === 'group' ? planGroupSend(selectedGroups, messageType) : null;
       if (plan?.mode === 'sequential') {
-        await sendToGroups(plan.chatIds, sendTo);
+        await sendToGroups(plan.chatIds, sendTo, isCurrent);
         return;
       }
 
       const result = await sendTo(chatId);
+      assertCurrent();
 
       setResponse({
-        success: !!result.messageId,
+        success: typeof result.messageId === 'string',
         messageId: result.messageId,
         timestamp: result.timestamp ? new Date(result.timestamp * 1000).toISOString() : new Date().toISOString(),
       });
     } catch (err) {
+      if (!isCurrent()) return;
       setResponse({
         success: false,
         timestamp: new Date().toISOString(),
@@ -556,7 +659,7 @@ export function MessageTester() {
         status: err instanceof Error ? (err as Error & { status?: number }).status : undefined,
       });
     } finally {
-      setIsLoading(false);
+      if (!unmountedRef.current && generation === sendGenerationRef.current) setIsLoading(false);
     }
   };
 
@@ -595,11 +698,9 @@ export function MessageTester() {
           placeholder="https://example.com/file.jpg"
           disabled={!!mediaFile}
         />
-        {messageType === 'bulk' && (
-          <span className="hint error" role="status">
-            {bulkMediaUrlInvalid ? t('messageTester.bulkMediaUrlInvalid') : ''}
-          </span>
-        )}
+        <span className="hint error" role="status">
+          {mediaUrlInvalid ? t('messageTester.bulkMediaUrlInvalid') : ''}
+        </span>
       </div>
       <div className="form-group">
         <label>
@@ -741,7 +842,7 @@ export function MessageTester() {
                     <label htmlFor="mt-13">{t('messageTester.recipientPhone')}</label>
                     <input
                       id="mt-13"
-                      type="text"
+                      type="tel"
                       value={recipient}
                       onChange={e => setRecipient(e.target.value)}
                       placeholder="+62812345678"
@@ -796,6 +897,7 @@ export function MessageTester() {
                   placeholder={t('messageTester.messagePlaceholder')}
                   rows={5}
                 />
+                {tooLongHint(content, MESSAGE_TEXT_MAX_LENGTH)}
               </div>
             )}
 
@@ -819,6 +921,7 @@ export function MessageTester() {
                           : t('messageTester.captionPlaceholder')
                       }
                     />
+                    {tooLongHint(content, mediaContentMax)}
                   </div>
                 )}
               </>
@@ -864,6 +967,7 @@ export function MessageTester() {
                     value={locationDescription}
                     onChange={e => setLocationDescription(e.target.value)}
                   />
+                  {tooLongHint(locationDescription.trim(), LOCATION_TEXT_MAX_LENGTH)}
                 </div>
                 <div className="form-group">
                   <label htmlFor="mt-16">
@@ -875,6 +979,7 @@ export function MessageTester() {
                     value={locationAddress}
                     onChange={e => setLocationAddress(e.target.value)}
                   />
+                  {tooLongHint(locationAddress.trim(), LOCATION_TEXT_MAX_LENGTH)}
                 </div>
               </>
             )}
@@ -890,16 +995,18 @@ export function MessageTester() {
                     onChange={e => setContactName(e.target.value)}
                     placeholder={t('messageTester.contactNamePlaceholder')}
                   />
+                  {tooLongHint(contactName.trim(), CONTACT_NAME_MAX_LENGTH)}
                 </div>
                 <div className="form-group">
                   <label htmlFor="mt-7">{t('messageTester.contactNumber')}</label>
                   <input
                     id="mt-7"
-                    type="text"
+                    type="tel"
                     value={contactNumber}
                     onChange={e => setContactNumber(e.target.value)}
                     placeholder="+62812345678"
                   />
+                  {tooLongHint(contactNumber.trim(), CONTACT_NUMBER_MAX_LENGTH)}
                 </div>
               </>
             )}
@@ -915,27 +1022,31 @@ export function MessageTester() {
                     onChange={e => setPollQuestion(e.target.value)}
                     placeholder={t('messageTester.pollQuestionPlaceholder')}
                   />
+                  {tooLongHint(pollQuestion.trim(), POLL_NAME_MAX_LENGTH)}
                 </div>
                 <div className="form-group">
                   <label>{t('messageTester.pollOptions')}</label>
                   {pollOptions.map((option, index) => (
-                    <div className="poll-option-row" key={index}>
-                      <input
-                        type="text"
-                        value={option}
-                        onChange={e => setPollOptions(prev => prev.map((o, i) => (i === index ? e.target.value : o)))}
-                        placeholder={t('messageTester.pollOptionPlaceholder', { index: index + 1 })}
-                      />
-                      <button
-                        type="button"
-                        className="remove-option-btn"
-                        onClick={() => setPollOptions(prev => prev.filter((_, i) => i !== index))}
-                        disabled={pollOptions.length <= 2}
-                        aria-label={t('messageTester.removeOption')}
-                      >
-                        <X size={14} />
-                      </button>
-                    </div>
+                    <Fragment key={index}>
+                      <div className="poll-option-row">
+                        <input
+                          type="text"
+                          value={option}
+                          onChange={e => setPollOptions(prev => prev.map((o, i) => (i === index ? e.target.value : o)))}
+                          placeholder={t('messageTester.pollOptionPlaceholder', { index: index + 1 })}
+                        />
+                        <button
+                          type="button"
+                          className="remove-option-btn"
+                          onClick={() => setPollOptions(prev => prev.filter((_, i) => i !== index))}
+                          disabled={pollOptions.length <= 2}
+                          aria-label={t('messageTester.removeOption')}
+                        >
+                          <X size={14} />
+                        </button>
+                      </div>
+                      {tooLongHint(option.trim(), POLL_OPTION_MAX_LENGTH)}
+                    </Fragment>
                   ))}
                   <button
                     type="button"
@@ -969,6 +1080,7 @@ export function MessageTester() {
                   <input
                     id="mt-17"
                     type="text"
+                    dir="ltr"
                     value={forwardFrom}
                     onChange={e => setForwardFrom(e.target.value)}
                     placeholder={
@@ -983,6 +1095,7 @@ export function MessageTester() {
                   <input
                     id="mt-9"
                     type="text"
+                    dir="ltr"
                     value={forwardTo}
                     onChange={e => setForwardTo(e.target.value)}
                     placeholder={t('messageTester.forwardToPlaceholder')}
@@ -993,6 +1106,7 @@ export function MessageTester() {
                   <input
                     id="mt-10"
                     type="text"
+                    dir="ltr"
                     value={forwardMessageId}
                     onChange={e => setForwardMessageId(e.target.value)}
                   />
@@ -1028,6 +1142,7 @@ export function MessageTester() {
                   </div>
                   <textarea
                     id="mt-11"
+                    dir="ltr"
                     value={bulkRecipients}
                     onChange={e => setBulkRecipients(e.target.value)}
                     placeholder={t('messageTester.bulkRecipientsPlaceholder')}
@@ -1055,7 +1170,9 @@ export function MessageTester() {
                             max: BULK_CAPTION_MAX_LENGTH,
                             count: captionLength(content),
                           })
-                        : ''}
+                        : bulkTextTooLong
+                          ? t('common.fieldTooLong', { max: MESSAGE_TEXT_MAX_LENGTH, count: captionLength(content) })
+                          : ''}
                   </span>
                 </div>
                 {mediaSourceFields}
@@ -1169,7 +1286,7 @@ export function MessageTester() {
                 {response.error && (
                   <div className="detail-row">
                     <span className="detail-label">{t('messageTester.response.error')}</span>
-                    <span className="detail-value" style={{ color: 'var(--error)' }}>
+                    <span className="detail-value" style={{ color: 'var(--error-text)' }}>
                       {response.error}
                     </span>
                   </div>
@@ -1202,10 +1319,12 @@ export function MessageTester() {
                     <span className="detail-label">{t('messageTester.response.notSent')}</span>
                     <span className="detail-value">
                       {response.groups.stoppedBy === 'refusal'
-                        ? t('messageTester.groupSendStopped', {
-                            count: response.groups.notSent,
-                            status: response.groups.refusedWith,
-                          })
+                        ? response.groups.refusedWith === undefined
+                          ? t('messageTester.groupSendStoppedNoAnswer', { count: response.groups.notSent })
+                          : t('messageTester.groupSendStopped', {
+                              count: response.groups.notSent,
+                              status: response.groups.refusedWith,
+                            })
                         : t('messageTester.groupSendCancelled', { count: response.groups.notSent })}
                     </span>
                   </div>

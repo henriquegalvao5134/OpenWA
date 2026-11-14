@@ -1,4 +1,5 @@
 import { BadRequestException, NotFoundException, PayloadTooLargeException } from '@nestjs/common';
+import { Readable } from 'stream';
 import { StatusService } from './status.service';
 import { StatusController } from './status.controller';
 import { EngineRegistry } from '../../engine/engine-registry.service';
@@ -10,6 +11,7 @@ import { plainToInstance } from 'class-transformer';
 import { validate } from 'class-validator';
 import { SendImageStatusDto, SendVideoStatusDto, SendVoiceStatusDto } from './dto/send-media-status.dto';
 import { SendPacingService } from '../message/send-pacing.service';
+import { LoggerService } from '../../common/services/logger.service';
 
 describe('StatusService media validation and selection', () => {
   const engine = {
@@ -29,7 +31,9 @@ describe('StatusService media validation and selection', () => {
   const passThrough = (_event: string, data: unknown) => Promise.resolve({ continue: true, data });
   const hookManager = { execute: jest.fn(passThrough) };
   const store = { list: jest.fn(), listByContact: jest.fn(), getMedia: jest.fn() };
-  const storageService = { getFile: jest.fn() };
+  const storageService = { openFile: jest.fn() };
+  /** What StorageService.openFile resolves with: the file as a stream, and its size. */
+  const opened = (bytes: Buffer) => ({ stream: Readable.from([bytes]), size: bytes.length });
   const pacing = {
     assertSendAllowed: jest.fn().mockResolvedValue(undefined),
     recordSendFailure: jest.fn(),
@@ -60,6 +64,37 @@ describe('StatusService media validation and selection', () => {
       await expect(service.postTextStatus('s1', 'hello', { recipients: [] })).rejects.toThrow('refused');
       expect(pacing.recordSendFailure).toHaveBeenCalledWith('s1');
       expect(pacing.recordSendSuccess).not.toHaveBeenCalled();
+    });
+
+    // The same classification picks the failures worth a log line: otherwise an engine-side failure
+    // leaves only Nest's generic `[ExceptionsHandler]` line, with no session to correlate it with.
+    it('logs the session and kind of a status post the engine refused', async () => {
+      const warn = jest.spyOn(LoggerService.prototype, 'warn').mockImplementation(() => undefined);
+      try {
+        engine.postImageStatus.mockRejectedValueOnce(new Error('upload failed: media entry was not created'));
+        await expect(
+          service.postImageStatus('s1', { base64: 'aGk=', mimetype: 'image/png' }, { recipients: [] }),
+        ).rejects.toThrow('upload failed');
+
+        expect(warn).toHaveBeenCalledWith(
+          'Status post failed in the engine (image)',
+          expect.objectContaining({ sessionId: 's1', error: 'Error: upload failed: media entry was not created' }),
+        );
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it('logs nothing for a refusal that says nothing about the account', async () => {
+      const warn = jest.spyOn(LoggerService.prototype, 'warn').mockImplementation(() => undefined);
+      try {
+        engine.postTextStatus.mockRejectedValueOnce(new BadRequestException('bad status'));
+        await expect(service.postTextStatus('s1', 'hello', { recipients: [] })).rejects.toThrow('bad status');
+
+        expect(warn).not.toHaveBeenCalled();
+      } finally {
+        warn.mockRestore();
+      }
     });
   });
 
@@ -92,21 +127,22 @@ describe('StatusService media validation and selection', () => {
       await expect(service.getStatusMedia('sess', 'w1')).rejects.toBeInstanceOf(NotFoundException);
     });
 
-    it('returns the media bytes and mimetype', async () => {
+    it('returns the opened file and its mimetype', async () => {
       store.getMedia.mockResolvedValue({ path: 'statuses/sess/x.jpg', mimetype: 'image/jpeg' });
-      storageService.getFile.mockResolvedValue(Buffer.from('x'));
+      storageService.openFile.mockResolvedValue(opened(Buffer.from('x')));
 
       const media = await service.getStatusMedia('sess', 'w1');
 
-      expect(media).toEqual({ buffer: Buffer.from('x'), mimetype: 'image/jpeg' });
+      expect(media).toMatchObject({ size: 1, mimetype: 'image/jpeg' });
+      expect(Buffer.concat(await media.stream.toArray())).toEqual(Buffer.from('x'));
       expect(store.getMedia).toHaveBeenCalledWith('sess', 'w1');
-      expect(storageService.getFile).toHaveBeenCalledWith('statuses/sess/x.jpg');
+      expect(storageService.openFile).toHaveBeenCalledWith('statuses/sess/x.jpg');
     });
 
-    it('maps an ENOENT from the file read to NotFoundException (purge raced the request), not a 500', async () => {
+    it('maps an ENOENT from the file open to NotFoundException (purge raced the request), not a 500', async () => {
       store.getMedia.mockResolvedValue({ path: 'statuses/sess/gone.jpg', mimetype: 'image/jpeg' });
       const enoent = Object.assign(new Error('no such file or directory'), { code: 'ENOENT' });
-      storageService.getFile.mockRejectedValue(enoent);
+      storageService.openFile.mockRejectedValue(enoent);
 
       await expect(service.getStatusMedia('sess', 'w1')).rejects.toBeInstanceOf(NotFoundException);
     });
@@ -116,14 +152,14 @@ describe('StatusService media validation and selection', () => {
       // rules make the row-outlived-file race most likely exactly there.
       store.getMedia.mockResolvedValue({ path: 'statuses/sess/gone.jpg', mimetype: 'image/jpeg' });
       const noSuchKey = Object.assign(new Error('The specified key does not exist.'), { name: 'NoSuchKey' });
-      storageService.getFile.mockRejectedValue(noSuchKey);
+      storageService.openFile.mockRejectedValue(noSuchKey);
 
       await expect(service.getStatusMedia('sess', 'w1')).rejects.toBeInstanceOf(NotFoundException);
     });
 
     it('rethrows non-missing-object storage errors unchanged', async () => {
       store.getMedia.mockResolvedValue({ path: 'statuses/sess/x.jpg', mimetype: 'image/jpeg' });
-      storageService.getFile.mockRejectedValue(new Error('S3 unavailable'));
+      storageService.openFile.mockRejectedValue(new Error('S3 unavailable'));
 
       await expect(service.getStatusMedia('sess', 'w1')).rejects.toThrow('S3 unavailable');
     });
@@ -132,7 +168,7 @@ describe('StatusService media validation and selection', () => {
       // The stored mimetype comes from the sender's message metadata — never trust it as a
       // Content-Type or the endpoint could serve active content (e.g. text/html) on the API origin.
       store.getMedia.mockResolvedValue({ path: 'statuses/sess/x.bin', mimetype: 'text/html' });
-      storageService.getFile.mockResolvedValue(Buffer.from('<script>'));
+      storageService.openFile.mockResolvedValue(opened(Buffer.from('<script>')));
 
       const media = await service.getStatusMedia('sess', 'w1');
 
@@ -144,7 +180,7 @@ describe('StatusService media validation and selection', () => {
       // status served with its declared Content-Type is stored-XSS material on the API origin.
       // The chat-media path already excludes it; this closes the same hole for status media.
       store.getMedia.mockResolvedValue({ path: 'statuses/sess/x.svg', mimetype: 'image/svg+xml' });
-      storageService.getFile.mockResolvedValue(Buffer.from('<svg/>'));
+      storageService.openFile.mockResolvedValue(opened(Buffer.from('<svg/>')));
 
       const media = await service.getStatusMedia('sess', 'w1');
 
@@ -166,7 +202,7 @@ describe('StatusService media validation and selection', () => {
         // trailing OWS; a browser strips both and renders `image/svg+xml` — the exclusion must match
         // what the browser will see, not the exact byte string.
         store.getMedia.mockResolvedValue({ path: 'statuses/sess/x.svg', mimetype });
-        storageService.getFile.mockResolvedValue(Buffer.from('<svg/>'));
+        storageService.openFile.mockResolvedValue(opened(Buffer.from('<svg/>')));
 
         const media = await service.getStatusMedia('sess', 'w1');
 
@@ -180,7 +216,7 @@ describe('StatusService media validation and selection', () => {
       'serves the comma-joined form %s as inert octet-stream',
       async mimetype => {
         store.getMedia.mockResolvedValue({ path: 'statuses/sess/x', mimetype });
-        storageService.getFile.mockResolvedValue(Buffer.from('x'));
+        storageService.openFile.mockResolvedValue(opened(Buffer.from('x')));
 
         const media = await service.getStatusMedia('sess', 'w1');
 
@@ -192,7 +228,7 @@ describe('StatusService media validation and selection', () => {
       // The exclusion is scoped to SVG: a perfectly ordinary `image/jpeg` with a charset parameter
       // (or any other image/video/audio type) must not be dragged down to octet-stream by it.
       store.getMedia.mockResolvedValue({ path: 'statuses/sess/x.jpg', mimetype: 'image/jpeg;charset=ISO-8859-1' });
-      storageService.getFile.mockResolvedValue(Buffer.from('x'));
+      storageService.openFile.mockResolvedValue(opened(Buffer.from('x')));
 
       const media = await service.getStatusMedia('sess', 'w1');
 
@@ -206,7 +242,7 @@ describe('StatusService media validation and selection', () => {
       ['image/png;x=1,text/html', 'image/png'],
     ])('serves a stored %s as %s', async (stored, served) => {
       store.getMedia.mockResolvedValue({ path: 'statuses/sess/x', mimetype: stored });
-      storageService.getFile.mockResolvedValue(Buffer.from('x'));
+      storageService.openFile.mockResolvedValue(opened(Buffer.from('x')));
 
       const media = await service.getStatusMedia('sess', 'w1');
 
@@ -328,6 +364,17 @@ describe('StatusService media validation and selection', () => {
     });
   });
 
+  // The status adapters fetch a URL with no fallback type of their own, so a host serving a generic
+  // Content-Type would leave the bytes labelled octet-stream; the route default is the only label they get.
+  it('labels an untyped URL with the route default for its kind', async () => {
+    const url = 'https://example.com/banner';
+    await service.postImageStatus('s1', { url }, { recipients: ['1@c.us'] });
+    await service.postVideoStatus('s1', { url }, { recipients: ['1@c.us'] });
+
+    expect(engine.postImageStatus).toHaveBeenCalledWith({ mimetype: 'image/jpeg', data: url }, expect.anything());
+    expect(engine.postVideoStatus).toHaveBeenCalledWith({ mimetype: 'video/mp4', data: url }, expect.anything());
+  });
+
   it('strips a data-URI prefix before handing base64 bytes to either engine path', async () => {
     const prefixed = 'data:image/png;base64,QUJD';
     await service.postImageStatus('s1', { base64: prefixed, mimetype: 'image/png' }, { recipients: ['1@c.us'] });
@@ -375,14 +422,16 @@ describe('StatusService media validation and selection', () => {
   // A status post publishes content from the account, so it passes the same `message:sending`
   // moderation gate as a chat send rather than going out unseen by plugins.
   describe('message:sending gate', () => {
-    it('consults the gate for text, image and video status posts', async () => {
+    it('consults the gate and the pacing check for text, image, video and voice status posts', async () => {
       await service.postTextStatus('s1', 'hello', { recipients: [] });
       await service.postImageStatus('s1', { base64: 'QUJD', mimetype: 'image/png' }, { recipients: [] });
       await service.postVideoStatus('s1', { base64: 'QUJD', mimetype: 'video/mp4' }, { recipients: [] });
+      await service.postVoiceStatus('s1', { base64: 'QUJD' }, { recipients: [] });
 
       const types = hookManager.execute.mock.calls.map(([, data]) => (data as { type: string }).type);
-      expect(types).toEqual(['status-text', 'status-image', 'status-video']);
+      expect(types).toEqual(['status-text', 'status-image', 'status-video', 'status-voice']);
       expect(hookManager.execute.mock.calls.every(([event]) => event === 'message:sending')).toBe(true);
+      expect(pacing.assertSendAllowed).toHaveBeenCalledTimes(4);
     });
 
     it('identifies itself as StatusService so a plugin can tell it from a chat send', async () => {
@@ -398,7 +447,11 @@ describe('StatusService media validation and selection', () => {
       await expect(service.postTextStatus('s1', 'spam', { recipients: [] })).rejects.toBeInstanceOf(
         BadRequestException,
       );
+      await expect(service.postVoiceStatus('s1', { base64: 'QUJD' }, { recipients: [] })).rejects.toBeInstanceOf(
+        BadRequestException,
+      );
       expect(engine.postTextStatus).not.toHaveBeenCalled();
+      expect(engine.postVoiceStatus).not.toHaveBeenCalled();
     });
 
     it('sends the plugin-rewritten text rather than the original', async () => {

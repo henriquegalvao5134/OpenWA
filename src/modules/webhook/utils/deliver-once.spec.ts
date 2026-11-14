@@ -110,11 +110,25 @@ describe('isDeliverableWebhook', () => {
     expect(isDeliverableWebhook({ active: true, events: ['*'] }, 'message.ack')).toBe(true);
   });
 
+  it('keeps message.receipt out of a wildcard subscription but delivers it when named', () => {
+    expect(isDeliverableWebhook({ active: true, events: ['*'] }, 'message.receipt')).toBe(false);
+    expect(isDeliverableWebhook({ active: true, events: ['*', 'message.receipt'] }, 'message.receipt')).toBe(true);
+    expect(isDeliverableWebhook({ active: true, events: ['message.receipt'] }, 'message.receipt')).toBe(true);
+  });
+
   it('refuses a missing, disabled or unsubscribed row', () => {
     expect(isDeliverableWebhook(null, 'message.received')).toBe(false);
     expect(isDeliverableWebhook(undefined, 'message.received')).toBe(false);
     expect(isDeliverableWebhook({ ...row, active: false }, 'message.received')).toBe(false);
     expect(isDeliverableWebhook(row, 'message.ack')).toBe(false);
+  });
+
+  it('refuses a row whose events column is not an array instead of throwing', () => {
+    for (const events of [null, '*', { 0: 'message.received' }]) {
+      expect(isDeliverableWebhook({ active: true, events: events as unknown as string[] }, 'message.received')).toBe(
+        false,
+      );
+    }
   });
 });
 

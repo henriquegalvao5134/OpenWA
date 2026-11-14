@@ -68,6 +68,13 @@ describe('ActiveKeyIndex', () => {
     expect(index.recognise({ 'x-api-key': 'fenced' }, '10.1.2.3')).toBe(sha('fenced'));
   });
 
+  it('treats a stored expiry that reads back as an invalid date as expired, as validateApiKey does', async () => {
+    const { index } = indexOver([row('garbled', { expiresAt: new Date('2020-W01-1') })]);
+    await index.onApplicationBootstrap();
+    index.onModuleDestroy();
+    expect(index.recognise({ 'x-api-key': 'garbled' }, '192.0.2.1')).toBeUndefined();
+  });
+
   it('keeps the previous view when a refresh fails', async () => {
     let fail = false;
     const { index } = indexOver(() => (fail ? Promise.reject(new Error('db down')) : Promise.resolve([row('k1')])));
@@ -77,6 +84,27 @@ describe('ActiveKeyIndex', () => {
     await (index as unknown as { loading: Promise<void> }).loading;
     index.onModuleDestroy();
     expect(index.recognise({ 'x-api-key': 'k1' }, '192.0.2.1')).toBe(sha('k1'));
+  });
+
+  it('recovers and populates the index when an initial bootstrap read fails transiently', async () => {
+    let attempts = 0;
+    const { index } = indexOver(() => {
+      attempts++;
+      if (attempts === 1) return Promise.reject(new Error('transient bootstrap db connection error'));
+      return Promise.resolve([row('k-bootstrap')]);
+    });
+
+    // Initial bootstrap load fails transiently; index stays empty without throwing
+    await index.onApplicationBootstrap();
+    expect(index.recognise({ 'x-api-key': 'k-bootstrap' }, '192.0.2.1')).toBeUndefined();
+
+    // Extra refresh (e.g. from seedApiKey bootstrap resilience) attempts reload
+    index.refreshSoon();
+    await (index as unknown as { loading: Promise<void> }).loading;
+    index.onModuleDestroy();
+
+    // Now populated successfully
+    expect(index.recognise({ 'x-api-key': 'k-bootstrap' }, '192.0.2.1')).toBe(sha('k-bootstrap'));
   });
 
   it('runs one more load when asked to refresh during a load, and none after destroy', async () => {

@@ -76,8 +76,10 @@ export interface Session {
   lastActive?: string | null;
   createdAt: string;
   updatedAt: string;
-  /** Human-readable reason carried while the status is 'failed' (terminal failure) or
-   * 'action_required' (operator must intervene, e.g. acknowledge an onboarding modal). */
+  /** Human-readable reason carried while the status is 'failed' (terminal failure),
+   * 'action_required' (operator must intervene, e.g. acknowledge an onboarding modal), or
+   * 'initializing' during an engine-internal reconnect (from the fifth consecutive attempt, or while a
+   * retry waits after a failed relaunch). */
   lastError?: string | null;
   /**
    * A limit WhatsApp itself has placed on the account, or null when there is none. Distinct from
@@ -110,10 +112,12 @@ export interface ChatPresence {
  *
  * `reachout_timelock` leaves the session connected and existing chats working — only starting new
  * conversations is blocked — which is why it can appear on a perfectly `ready` session. `tos_block`
- * and `proxy_block` refuse the connection itself and so cannot.
+ * and `proxy_block` refuse the connection itself and so cannot. `passkey_required` is WhatsApp asking
+ * for a passkey before it completes a link, which the Baileys engine cannot answer; the session stays
+ * at its QR, so it appears on a session that is not yet linked and never on a `ready` one.
  */
 export interface AccountRestriction {
-  kind: 'reachout_timelock' | 'tos_block' | 'proxy_block';
+  kind: 'reachout_timelock' | 'tos_block' | 'proxy_block' | 'passkey_required';
   /** The engine's own token for the cause, verbatim (`TOS_BLOCK`, `BIZ_QUALITY`, …). */
   code: string;
   /** ISO timestamp when enforcement ends, when WhatsApp states one. */
@@ -253,6 +257,7 @@ export interface Chat {
   unreadCount: number;
   timestamp: number;
   lastMessage?: string;
+  lastMessageType?: MessageType;
   archived: boolean;
   pinned: boolean;
   muted: boolean;
@@ -313,10 +318,26 @@ export interface ChatMessage {
   status: 'pending' | 'sent' | 'delivered' | 'read' | 'failed';
   timestamp?: number;
   createdAt: string;
+  /**
+   * Storage key of the archived media copy. Null once retention deleted it, even where an older gateway left
+   * `metadata.media.archived` set. Absent on live socket payloads and engine history.
+   */
+  mediaPath?: string | null;
   metadata?: {
-    media?: { mimetype: string; filename?: string; data?: string; omitted?: boolean; sizeBytes?: number };
+    poll?: { name: string; options: string[]; allowMultipleAnswers: boolean };
+    media?: {
+      mimetype: string;
+      filename?: string;
+      data?: string;
+      omitted?: boolean;
+      sizeBytes?: number;
+      /** With `omitted`: the inline copy was dropped because the chat-media archive holds the bytes. */
+      archived?: boolean;
+    };
     quotedMessage?: { id: string; body: string };
     reactions?: Record<string, string>;
+    /** The gateway observed an edit of this message. */
+    edited?: boolean;
     call?: { video: boolean; missed: boolean };
     /** Business prompt choices (Baileys). Present on inbound prompts that offer buttons. */
     buttons?: Array<{ id: string; text: string }>;
@@ -340,6 +361,10 @@ export interface EngineHistoryMessage {
   kind: ChatKind;
   /** Disappearing-messages timer on the chat, in seconds. Absent when the chat has none set. */
   ephemeralDuration?: number;
+  /** True when the sender forwarded this message rather than writing it. Absent otherwise. */
+  isForwarded?: boolean;
+  /** How many times the message has been forwarded. Set with `isForwarded`. */
+  forwardingScore?: number;
   /** Sender in a group: `from` is the group JID, so this participant WID is the real poster. */
   author?: string;
   mentionedIds?: string[];
@@ -377,6 +402,7 @@ export interface EngineHistoryMessage {
     omitted?: boolean;
     sizeBytes?: number;
   };
+  poll?: { name: string; options: string[]; allowMultipleAnswers: boolean };
   quotedMessage?: { id: string; body: string };
   location?: { latitude: number; longitude: number; description?: string; address?: string; url?: string };
   /** Present on `order` messages only: the placed cart, plus the single-order token for its items. */
@@ -424,13 +450,46 @@ export interface ContactStatusGroup {
   latest: string;
 }
 
-// Minimal contact type for the recipient picker; the backend GET /sessions/:id/contacts
-// returns a Contact array; fields beyond id are optional.
+/** GET /sessions/:id/groups/:groupId (GroupInfoDto). */
+export interface GroupInfo {
+  id: string;
+  name: string;
+  description?: string;
+  owner?: string;
+  createdAt?: number;
+  participants: Array<{ id: string; number: string; name?: string; isAdmin: boolean; isSuperAdmin: boolean }>;
+  /** Only admins may edit the group's info. */
+  locked?: boolean;
+  announce?: boolean;
+}
+
+export interface GroupAck {
+  success: boolean;
+  message: string;
+}
+
+/** One participant's outcome of a membership write; the gateway answers 200 even when some are refused. */
+export interface GroupParticipantResult {
+  id: string;
+  success: boolean;
+  status?: number;
+  message?: string;
+}
+
+export interface GroupParticipantsAck extends GroupAck {
+  results: GroupParticipantResult[];
+}
+
+// An entry of the session's address book, from GET /sessions/:id/contacts: what the recipient pickers and the
+// chat list's saved-contact check read. Only the name, push name and picture are optional.
 export interface Contact {
   id: string;
   name?: string;
   pushName?: string;
-  /** MSISDN digits without separators — always present in the response. */
+  /**
+   * MSISDN digits for a `<phone>@c.us` id. For an `<lid>@lid` id, the lid's digits on whatsapp-web.js, which are
+   * not a phone number, and on Baileys the phone's digits, or '' when the phone is unknown.
+   * Digits only, no separators — always present in the response. */
   number: string;
   isMyContact: boolean;
   isBlocked: boolean;
@@ -495,6 +554,7 @@ export interface BulkMessageItem {
     audio?: BulkMediaPayload;
     document?: BulkMediaPayload;
     caption?: string;
+    mentions?: string[];
   };
   variables?: Record<string, string>;
 }
@@ -536,7 +596,7 @@ export interface BatchMessageResult {
   sentAt?: string;
 }
 
-/** GET batch/:batchId shape; the cancel endpoint returns the same minus results/timestamps. */
+/** GET batch/:batchId shape. */
 export interface BatchStatusResponse {
   batchId: string;
   status: BatchStatus;
@@ -545,6 +605,13 @@ export interface BatchStatusResponse {
   results: BatchMessageResult[];
   startedAt?: string | null;
   completedAt?: string | null;
+}
+
+/** POST batch/:batchId/cancel shape: the batch state without per-recipient results or timestamps. */
+export interface BatchCancelResponse {
+  batchId: string;
+  status: BatchStatus;
+  progress: BatchProgress;
 }
 
 export interface HealthStatus {
@@ -569,19 +636,33 @@ export interface UpdateCheck {
 
 export interface InfraStatus {
   // `builtIn` = OpenWA's own bundled container is actually running and backing this service (live),
-  // not just the saved intent — falls back to the saved flag when Docker is unavailable. (#488)
-  database: { connected: boolean; type: string; host: string; builtIn: boolean };
-  redis: { enabled: boolean; connected: boolean; host: string; port: number; builtIn: boolean };
+  // not just the saved intent; falls back to the saved flag (the environment's first) beside a host that reaches the
+  // bundled container when Docker is unavailable. (#488) `running` = a bundled container OpenWA created is up,
+  // whether or not the service uses it, beside this instance's own built-in flag (the environment's first, else the
+  // saved one); false for one Docker Compose created and with that flag not true, absent while Docker is unreachable,
+  // and from an older gateway.
+  database: { connected: boolean; type: string; host: string; builtIn: boolean; running?: boolean };
+  redis: { enabled: boolean; connected: boolean; host: string; port: number; builtIn: boolean; running?: boolean };
   queue: {
     enabled: boolean;
     webhooks: { pending: number; completed: number; failed: number };
   };
-  storage: { type: 'local' | 's3'; path?: string; bucket?: string; builtIn: boolean; s3Available?: boolean };
+  storage: {
+    type: 'local' | 's3';
+    path?: string;
+    bucket?: string;
+    // S3 only, when an endpoint is set: the one the server dials, which a stopped bundled MinIO still names.
+    endpoint?: string;
+    builtIn: boolean;
+    running?: boolean;
+    s3Available?: boolean;
+  };
   engine: {
     type: string;
     headless: boolean;
-    // whatsapp-web.js only: the WhatsApp Web build sessions request as their pin (distinct from the
-    // library version, and not necessarily the build a page runs) and how it was chosen. (#488)
+    // whatsapp-web.js only: the WhatsApp Web build the gateway resolves for sessions to pin (distinct from the
+    // library version, and not necessarily the build a page runs: a session whose pinned page cannot be
+    // downloaded or written starts unpinned) and how it was chosen. (#488)
     webVersion?: string | null;
     webVersionSource?: 'pinned' | 'auto' | 'native';
   };
@@ -602,6 +683,11 @@ export interface SavedConfig {
   database: {
     type: 'sqlite' | 'postgres';
     builtIn: boolean;
+    // Whether the saved config states the built-in mode of this service. False when a host the environment
+    // pins decides it, when the file does not select the service (the first boot writes every flag as false),
+    // when the file holds the bundled host with the flag not true (the next boot dials the container) and when
+    // nothing is saved: the form then follows what /infra/status reports as running.
+    builtInSet: boolean;
     host: string;
     port: string;
     username: string;
@@ -612,11 +698,12 @@ export interface SavedConfig {
     sslRejectUnauthorized: boolean;
     passwordSet: boolean;
   };
-  redis: { enabled: boolean; builtIn: boolean; host: string; port: string; passwordSet: boolean };
+  redis: { enabled: boolean; builtIn: boolean; builtInSet: boolean; host: string; port: string; passwordSet: boolean };
   queue: { enabled: boolean };
   storage: {
     type: 'local' | 's3';
     builtIn: boolean;
+    builtInSet: boolean;
     localPath: string;
     s3Bucket: string;
     s3Region: string;
@@ -628,7 +715,8 @@ export interface SavedConfig {
 
 export interface SaveConfigPayload {
   database?: {
-    type: 'sqlite' | 'postgres';
+    // Absent keeps the stored selection; the form leaves out a type the environment pins.
+    type?: 'sqlite' | 'postgres';
     builtIn?: boolean;
     host?: string;
     port?: string;
@@ -651,7 +739,7 @@ export interface SaveConfigPayload {
     enabled?: boolean;
   };
   storage?: {
-    type: 'local' | 's3';
+    type?: 'local' | 's3';
     builtIn?: boolean;
     localPath?: string;
     s3Bucket?: string;
@@ -719,15 +807,24 @@ export interface SearchResults {
 // fails; the never-settling promise halts this request's chain so callers neither flash a generic
 // error toast nor receive an undefined payload while the page navigates away. Otherwise throw an
 // Error carrying the HTTP status and, when the gateway supplied one, its machine code.
-async function handleErrorResponse<T>(response: Response): Promise<T> {
+// `sentKey` is the key the request carried (null when none). Logout aborts nothing in flight, so an
+// answer can arrive after the stored key changed. With a key sent but none stored, a sign-out is
+// already under way (an earlier failure of the same burst, or the user on the login form): stay
+// silent and do not navigate again. A request sent without a key comes only from a chain that
+// outlived a logout (the dashboard shows the login form whenever no key is stored), so with none
+// stored it stays silent too rather than reloading the login form under the user. With another key
+// stored, the answer speaks for a key no longer in use and must not sign out the current one, so it
+// fails like any other error.
+async function handleErrorResponse<T>(response: Response, sentKey: string | null): Promise<T> {
   // On a non-JSON body (e.g. a reverse-proxy 502/503/504 HTML page) fall through to `HTTP <status>`
   // rather than statusText: the toast folds an exact `HTTP 502`/`HTTP 503` into its connection-lost
   // toast (a 504 keeps its own), and statusText is empty over HTTP/2 anyway.
   const error = await response.json().catch(() => ({}));
-  if (isKeyUnusable(response.status, error.message)) {
+  const storedKey = sessionStorage.getItem('openwa_api_key');
+  if (isKeyUnusable(response.status, error.message) && (storedKey === sentKey || storedKey === null)) {
     sessionStorage.removeItem('openwa_api_key');
     if (typeof window !== 'undefined') {
-      window.location.assign('/');
+      if (sentKey !== null && storedKey === sentKey) window.location.assign('/');
       return new Promise<T>(() => {});
     }
   }
@@ -740,9 +837,13 @@ async function handleErrorResponse<T>(response: Response): Promise<T> {
   const err = new Error(error.message || `HTTP ${response.status}`) as Error & {
     status?: number;
     code?: string;
+    retryAfterSeconds?: number;
   };
   err.status = response.status;
   if (typeof error.code === 'string') err.code = error.code;
+  // Retry-After in seconds (an HTTP date is ignored): the media loaders wait at least that long before retrying a 503.
+  const retryAfter = Number(response.headers.get('Retry-After') ?? Number.NaN);
+  if (retryAfter >= 0) err.retryAfterSeconds = retryAfter;
   throw err;
 }
 
@@ -763,7 +864,7 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
   const response = await fetch(url, { ...options, headers });
 
   if (!response.ok) {
-    return handleErrorResponse<T>(response);
+    return handleErrorResponse<T>(response, apiKey);
   }
 
   if (response.status === 204) {
@@ -781,14 +882,14 @@ async function requestText(endpoint: string): Promise<string> {
   });
 
   if (!response.ok) {
-    return handleErrorResponse<string>(response);
+    return handleErrorResponse<string>(response, apiKey);
   }
 
   return response.text();
 }
 
 /** Like {@link request} but returns a Blob — e.g. for status media downloads. */
-async function requestBlob(endpoint: string): Promise<Blob> {
+async function requestBlob(endpoint: string, signal?: AbortSignal): Promise<Blob> {
   const url = `${API_BASE_URL}${endpoint}`;
 
   // Get API key from sessionStorage for authentication
@@ -798,10 +899,10 @@ async function requestBlob(endpoint: string): Promise<Blob> {
     ...(apiKey ? { 'X-API-Key': apiKey } : {}),
   };
 
-  const response = await fetch(url, { headers });
+  const response = await fetch(url, { headers, signal });
 
   if (!response.ok) {
-    return handleErrorResponse<Blob>(response);
+    return handleErrorResponse<Blob>(response, apiKey);
   }
 
   return response.blob();
@@ -849,9 +950,111 @@ export const sessionApi = {
   getStats: () => request<SessionStats>('/sessions/stats/overview'),
   getGroups: (id: string) =>
     request<{ id: string; name?: string; linkedParentJID?: string | null }[]>(`/sessions/${id}/groups`),
-  getChats: (id: string) => request<Chat[]>(`/sessions/${id}/chats`),
-  markChatRead: (id: string, chatId: string) =>
+  // Operator route, Baileys only: whatsapp-web.js answers 501. Participants are WhatsApp ids (`…@c.us`).
+  createGroup: (id: string, name: string, participants: string[]) =>
+    request<{ id: string; name: string }>(`/sessions/${id}/groups`, {
+      method: 'POST',
+      body: JSON.stringify({ name, participants }),
+    }),
+  getGroup: (id: string, groupId: string) =>
+    request<GroupInfo>(`/sessions/${id}/groups/${encodeURIComponent(groupId)}`),
+  // The group writes below are operator routes. Whether WhatsApp lets this account make them (an admin,
+  // or any member while the group's info is unlocked) is decided by WhatsApp; a refusal answers 403.
+  setGroupSubject: (id: string, groupId: string, subject: string) =>
+    request<GroupAck>(`/sessions/${id}/groups/${encodeURIComponent(groupId)}/subject`, {
+      method: 'PUT',
+      body: JSON.stringify({ subject }),
+    }),
+  setGroupDescription: (id: string, groupId: string, description: string) =>
+    request<GroupAck>(`/sessions/${id}/groups/${encodeURIComponent(groupId)}/description`, {
+      method: 'PUT',
+      body: JSON.stringify({ description }),
+    }),
+  setGroupPicture: (id: string, groupId: string, base64: string, mimetype: string) =>
+    request<GroupAck>(`/sessions/${id}/groups/${encodeURIComponent(groupId)}/picture`, {
+      method: 'PUT',
+      body: JSON.stringify({ base64, mimetype }),
+    }),
+  addGroupParticipants: (id: string, groupId: string, participants: string[]) =>
+    request<GroupParticipantsAck>(`/sessions/${id}/groups/${encodeURIComponent(groupId)}/participants`, {
+      method: 'POST',
+      body: JSON.stringify({ participants }),
+    }),
+  removeGroupParticipants: (id: string, groupId: string, participants: string[]) =>
+    request<GroupParticipantsAck>(`/sessions/${id}/groups/${encodeURIComponent(groupId)}/participants`, {
+      method: 'DELETE',
+      body: JSON.stringify({ participants }),
+    }),
+  setGroupAdmins: (id: string, groupId: string, participants: string[], admin: boolean) =>
+    request<GroupParticipantsAck>(
+      `/sessions/${id}/groups/${encodeURIComponent(groupId)}/participants/${admin ? 'promote' : 'demote'}`,
+      { method: 'POST', body: JSON.stringify({ participants }) },
+    ),
+  leaveGroup: (id: string, groupId: string) =>
+    request<GroupAck>(`/sessions/${id}/groups/${encodeURIComponent(groupId)}/leave`, { method: 'POST' }),
+  getChats: async (id: string, signal?: AbortSignal) => {
+    let lastError: unknown;
+    const { items, throttled } = await fetchAllPages<Chat>(
+      async (limit, offset) => {
+        signal?.throwIfAborted();
+        try {
+          const data = await request<Chat[]>(`/sessions/${id}/chats?limit=${limit}&offset=${offset}`, { signal });
+          return { data, total: data.length < limit ? offset + data.length : Infinity };
+        } catch (err) {
+          lastError = err;
+          throw err;
+        } finally {
+          signal?.throwIfAborted();
+        }
+      },
+      { pageSize: 1000, maxItems: Infinity },
+    );
+    // A later throttled page must fail the load rather than present an incomplete sidebar.
+    if (throttled) throw lastError;
+    const seen = new Set<string>();
+    return items.filter(chat => {
+      if (seen.has(chat.id)) return false;
+      seen.add(chat.id);
+      return true;
+    });
+  },
+  // `messageIds` are the messages to acknowledge. Baileys acknowledges them one by one and, without any, only the
+  // newest it holds; whatsapp-web.js reads the whole chat and ignores them.
+  markChatRead: (id: string, chatId: string, messageIds?: string[]) =>
     request<{ success: boolean }>(`/sessions/${id}/chats/read`, {
+      method: 'POST',
+      body: JSON.stringify({ chatId, ...(messageIds?.length ? { messageIds } : {}) }),
+    }),
+  // Both also delete the gateway's stored copy of the chat's messages (rows, media, search entries).
+  clearChatMessages: (id: string, chatId: string) =>
+    request<{ success: boolean }>(`/sessions/${id}/chats/${encodeURIComponent(chatId)}/messages`, {
+      method: 'DELETE',
+    }),
+  deleteChat: (id: string, chatId: string) =>
+    request<{ success: boolean }>(`/sessions/${id}/chats/delete`, {
+      method: 'POST',
+      body: JSON.stringify({ chatId }),
+    }),
+  // Archive and pin answer `{ success: false }` when the engine declined to act (WhatsApp keeps at most three
+  // chats pinned), which the callers treat as a failure. Mute has no declined outcome and always answers success.
+  archiveChat: (id: string, chatId: string, archive: boolean) =>
+    request<{ success: boolean }>(`/sessions/${id}/chats/archive`, {
+      method: 'POST',
+      body: JSON.stringify({ chatId, archive }),
+    }),
+  pinChat: (id: string, chatId: string, pin: boolean) =>
+    request<{ success: boolean }>(`/sessions/${id}/chats/pin`, {
+      method: 'POST',
+      body: JSON.stringify({ chatId, pin }),
+    }),
+  /** `muteUntil` is epoch MILLISECONDS; null unmutes. */
+  muteChat: (id: string, chatId: string, muteUntil: number | null) =>
+    request<{ success: boolean }>(`/sessions/${id}/chats/mute`, {
+      method: 'POST',
+      body: JSON.stringify({ chatId, muteUntil }),
+    }),
+  markChatUnread: (id: string, chatId: string) =>
+    request<{ success: boolean }>(`/sessions/${id}/chats/unread`, {
       method: 'POST',
       body: JSON.stringify({ chatId }),
     }),
@@ -877,14 +1080,17 @@ export const sessionApi = {
   // MESSAGE_LIST_INLINE_MEDIA_BUDGET_BYTES; past that budget the payload arrives as the
   // `{ omitted: true, sizeBytes }` marker and the bytes are only reachable here. Served as an
   // attachment (Content-Disposition), so callers download it rather than rendering it inline.
-  getMessageMediaBlob: (id: string, chatId: string, messageId: string) =>
-    requestBlob(`/sessions/${id}/messages/${encodeURIComponent(chatId)}/${encodeURIComponent(messageId)}/media`),
+  getMessageMediaBlob: (id: string, chatId: string, messageId: string, signal?: AbortSignal) =>
+    requestBlob(
+      `/sessions/${id}/messages/${encodeURIComponent(chatId)}/${encodeURIComponent(messageId)}/media`,
+      signal,
+    ),
   getSubscribedChannels: (id: string) => request<Channel[]>(`/sessions/${id}/channels`),
   getChannelMessages: (id: string, channelId: string, limit = 50) =>
     request<ChannelMessage[]>(`/sessions/${id}/channels/${encodeURIComponent(channelId)}/messages?limit=${limit}`),
   getContactStatuses: (id: string) => request<{ statuses: StatusUpdate[] }>(`/sessions/${id}/status`),
-  getStatusMediaBlob: (id: string, statusId: string) =>
-    requestBlob(`/sessions/${id}/status/${encodeURIComponent(statusId)}/media`),
+  getStatusMediaBlob: (id: string, statusId: string, signal?: AbortSignal) =>
+    requestBlob(`/sessions/${id}/status/${encodeURIComponent(statusId)}/media`, signal),
   postTextStatus: (
     id: string,
     text: string,
@@ -959,7 +1165,7 @@ export const templateApi = {
 export interface CheckNumberResponse {
   number: string;
   exists: boolean;
-  /** Engine-canonical WhatsApp id for the number (e.g. `…@c.us` or `…@lid`), or null if unregistered. */
+  /** The number's WhatsApp id in the neutral `<phone>@c.us` form on both engines, or null if unregistered. */
   whatsappId: string | null;
 }
 
@@ -970,17 +1176,43 @@ export interface ProfilePictureResponse {
 
 export const contactApi = {
   // The route caps a response at 1000 contacts; walk the pages so an address book past that is complete.
-  list: async (sessionId: string) =>
-    (
-      await fetchAllPages(
-        async (limit, offset) => {
+  // No item cap: the status recipient picker needs every contact, and the server's short page ends the walk.
+  list: async (sessionId: string) => {
+    let lastError: unknown;
+    const { items, throttled } = await fetchAllPages(
+      async (limit, offset) => {
+        try {
           const data = await request<Contact[]>(`/sessions/${sessionId}/contacts?limit=${limit}&offset=${offset}`);
           // The route answers a bare array with no total: a short page is the last one.
           return { data, total: data.length < limit ? offset + data.length : Infinity };
-        },
-        { pageSize: 1000 },
-      )
-    ).items,
+        } catch (err) {
+          lastError = err;
+          throw err;
+        }
+      },
+      { pageSize: 1000, maxItems: Infinity },
+    );
+    // A page still throttled after the retries would leave the picker silently short; fail the whole
+    // load with that page's 429, as a throttled first page already does.
+    if (throttled) throw lastError;
+    return items;
+  },
+  /** The ids of the contacts this account has blocked. */
+  listBlocked: (sessionId: string) => request<string[]>(`/sessions/${sessionId}/contacts/blocked`),
+  block: (sessionId: string, contactId: string) =>
+    request<{ success: boolean }>(`/sessions/${sessionId}/contacts/${encodeURIComponent(contactId)}/block`, {
+      method: 'POST',
+    }),
+  unblock: (sessionId: string, contactId: string) =>
+    request<{ success: boolean }>(`/sessions/${sessionId}/contacts/${encodeURIComponent(contactId)}/block`, {
+      method: 'DELETE',
+    }),
+  /** Save the contact to the account's address book, or rename the entry it has. */
+  upsert: (sessionId: string, contactId: string, firstName: string, lastName?: string) =>
+    request<{ success: boolean }>(`/sessions/${sessionId}/contacts/${encodeURIComponent(contactId)}`, {
+      method: 'PUT',
+      body: JSON.stringify({ firstName, ...(lastName ? { lastName } : {}) }),
+    }),
   checkNumber: (sessionId: string, number: string) =>
     request<CheckNumberResponse>(`/sessions/${sessionId}/contacts/check/${encodeURIComponent(number)}`),
   // Returns the contact/group profile picture URL. Both engines return null when the user hid their
@@ -1115,7 +1347,7 @@ export const messageApi = {
   getBatchStatus: (sessionId: string, batchId: string) =>
     request<BatchStatusResponse>(`/sessions/${sessionId}/messages/batch/${encodeURIComponent(batchId)}`),
   cancelBatch: (sessionId: string, batchId: string) =>
-    request<BatchStatusResponse>(`/sessions/${sessionId}/messages/batch/${encodeURIComponent(batchId)}/cancel`, {
+    request<BatchCancelResponse>(`/sessions/${sessionId}/messages/batch/${encodeURIComponent(batchId)}/cancel`, {
       method: 'POST',
     }),
   reply: (sessionId: string, data: { chatId: string; quotedMessageId: string; text: string }) =>
@@ -1175,7 +1407,7 @@ export const infraApi = {
       method: 'PUT',
       body: JSON.stringify(config),
     }),
-  restart: (profiles?: string[], profilesToRemove?: string[]) =>
+  restart: (profiles?: string[], profilesToRemove?: string[], signal?: AbortSignal) =>
     request<{
       message: string;
       restarting: boolean;
@@ -1188,12 +1420,14 @@ export const infraApi = {
     }>('/infra/restart', {
       method: 'POST',
       body: JSON.stringify({ profiles: profiles || [], profilesToRemove: profilesToRemove || [] }),
+      signal,
     }),
   // Readiness, not the plain /infra/health ping. The restart poll must not be able to latch onto the
-  // process it just asked to shut down: /infra/health answers 200 for the whole drain and teardown,
+  // process it just asked to shut down: /infra/health answers 200 for the whole drain,
   // while /health/ready reports 503 as soon as draining starts and stays 503 until both databases
   // answer. Public (no API key), like /infra/health.
-  healthCheck: () => request<{ status: 'ok' | 'error'; details: Record<string, { status: string }> }>('/health/ready'),
+  healthCheck: (signal?: AbortSignal) =>
+    request<{ status: 'ok' | 'error'; details: Record<string, { status: string }> }>('/health/ready', { signal }),
   // Data migration: export all Data-DB tables (call while still on the OLD database, before switching),
   // then import after the switch + restart. Used by the DB-switch migration guard so data isn't lost.
   exportData: () =>

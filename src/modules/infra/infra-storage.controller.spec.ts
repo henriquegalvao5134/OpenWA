@@ -3,11 +3,6 @@ import * as os from 'os';
 import * as path from 'path';
 import { Readable, Writable } from 'stream';
 
-// StorageService (imported transitively by the infra controllers) pulls in `archiver`
-// v8, which is ESM-only and cannot be parsed by ts-jest. The controller logic
-// under test never touches archiver, so a lightweight stub is sufficient.
-jest.mock('archiver', () => ({ default: jest.fn() }));
-
 // saveConfig writes the generated env via fs.writeFileSync and reads the existing file
 // via fs.existsSync/readFileSync; mock those so tests assert produced content without
 // touching the filesystem. existsSync defaults to false (no prior config).
@@ -336,6 +331,36 @@ describe('InfraStorageController audit trail (light-dependency handlers)', () =>
     }
   });
 
+  it('importStorage records how many entries an aborted import had already written', async () => {
+    const audit = { logInfo: jest.fn().mockResolvedValue(null), logWarn: jest.fn().mockResolvedValue(null) };
+    const cwdSpy = jest.spyOn(process, 'cwd').mockReturnValue('/srv/openwa');
+    (fs.existsSync as jest.Mock).mockImplementation((p: string) => p === '/srv/openwa/data/exports/x.tar.gz');
+    try {
+      const abort = Object.assign(new Error('archive exceeds 100000 entries'), { imported: 100000, failed: 2 });
+      const storageService = {
+        importFromStream: jest.fn().mockRejectedValue(abort),
+        getCurrentStorageType: () => 'local',
+      };
+      await expect(
+        new InfraStorageController(storageService as never, audit as never).importStorage({
+          filePath: 'data/exports/x.tar.gz',
+        }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(audit.logWarn).toHaveBeenCalledWith(AuditAction.INFRA_STORAGE_IMPORTED, {
+        metadata: {
+          aborted: true,
+          error: 'archive exceeds 100000 entries',
+          storageType: 'local',
+          count: 100000,
+          failed: 2,
+        },
+      });
+    } finally {
+      cwdSpy.mockRestore();
+      (fs.existsSync as jest.Mock).mockReturnValue(false);
+    }
+  });
+
   it('importStorage records an aborted import as a warning, since the entries before the abort were kept', async () => {
     const audit = { logInfo: jest.fn().mockResolvedValue(null), logWarn: jest.fn().mockResolvedValue(null) };
     const cwdSpy = jest.spyOn(process, 'cwd').mockReturnValue('/srv/openwa');
@@ -457,5 +482,46 @@ describe('InfraStorageController.importStorage reports an import that wrote noth
 
   it('keeps imported:true for an empty archive', async () => {
     await expect(importWith({ imported: 0, failed: 0 })).resolves.toMatchObject({ imported: true, count: 0 });
+  });
+});
+
+describe('InfraStorageController export setup failure', () => {
+  it('prepares the directory before starting archive work', async () => {
+    const filesystem = jest.requireMock<typeof import('fs')>('fs');
+    const mkdir = jest.spyOn(filesystem, 'mkdirSync').mockImplementation(() => {
+      throw new Error('directory unavailable');
+    });
+    const source = Readable.from(['archive']);
+    const create = jest.fn().mockResolvedValue(source);
+    (fs.existsSync as jest.Mock).mockReturnValueOnce(false);
+    const controller = new InfraStorageController({
+      getCurrentStorageType: () => 'local',
+      createExportStream: create,
+    } as never);
+    try {
+      await expect(controller.exportStorage()).rejects.toThrow('directory unavailable');
+      expect(create).not.toHaveBeenCalled();
+    } finally {
+      mkdir.mockRestore();
+      source.destroy();
+    }
+  });
+
+  it('closes the archive if constructing the destination throws', async () => {
+    const source = Readable.from(['archive']);
+    (fs.existsSync as jest.Mock).mockReturnValueOnce(true);
+    (fs.createWriteStream as jest.Mock).mockImplementationOnce(() => {
+      throw new Error('destination unavailable');
+    });
+    const controller = new InfraStorageController({
+      getCurrentStorageType: () => 'local',
+      createExportStream: jest.fn().mockResolvedValue(source),
+    } as never);
+    try {
+      await expect(controller.exportStorage()).rejects.toThrow('destination unavailable');
+      expect(source.destroyed).toBe(true);
+    } finally {
+      source.destroy();
+    }
   });
 });

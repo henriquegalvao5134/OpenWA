@@ -4,6 +4,9 @@ import { computeSendPacingConfig } from '../modules/message/send-pacing.config';
 import { resolveInflightBodyBudgetBytes } from './inflight-body-budget';
 import { resolveRequestTimeoutMs } from './http-timeouts';
 import { readWsRateLimitConfig } from '../modules/events/ws-rate-limit';
+import { DEFAULT_WEBHOOK_SHUTDOWN_DRAIN_MS, MAX_TIMER_MS } from '../common/services/shutdown-budget';
+import { parseTrustedProxies } from '../common/utils/ip';
+import { positiveIntFromEnv } from '../common/utils/env-int';
 
 /**
  * Root of the host's persistent state. Relative on purpose: the image sets WORKDIR /app and mounts
@@ -60,7 +63,7 @@ export function resolveNonNegativeIntEnv(raw: string | undefined, fallback: numb
  * arms `protocolTimeout` with a plain `setTimeout` (`common/CallbackRegistry.js`), so the ceiling
  * applies to it directly and the browser never finishes launching.
  */
-export const MAX_TIMER_MS = 2147483647;
+export { MAX_TIMER_MS };
 
 /**
  * The UI locale Chromium is pinned to. Without a pin the browser's language is whatever the launched
@@ -109,15 +112,15 @@ export default () => ({
   // HTTP server timeouts (Node http.Server). Pinned explicitly so they are operator-tunable and
   // observable at boot rather than left at Node's implicit defaults. requestTimeout defaults to
   // Node's 300s; keepAliveTimeout to 5s; headersTimeout to 65s (a second above keepAlive — Node
-  // requires headers > keepAlive, and main.ts normalizes it anyway). Set any to 0 at your own risk;
-  // env.validation rejects 0 so a bound is never silently disabled.
+  // requires headers > keepAlive, and main.ts normalizes it anyway). env.validation rejects 0 for all
+  // three, so a bound is never silently disabled.
   http: {
     requestTimeoutMs: resolveRequestTimeoutMs(process.env.REQUEST_TIMEOUT_MS),
     headersTimeoutMs: parseInt(process.env.HEADERS_TIMEOUT_MS || '65000', 10),
     keepAliveTimeoutMs: parseInt(process.env.KEEPALIVE_TIMEOUT_MS || '5000', 10),
     // Aggregate cap on request-body bytes buffered across ALL connections (the pre-body-parser
-    // budget middleware in main.ts). Defaults to 4 × the per-request BODY_SIZE_LIMIT so the two
-    // scale together; explicit bytes override via INFLIGHT_BODY_BUDGET_BYTES.
+    // budget middleware in src/configure-app.ts). Defaults to 4 × the per-request BODY_SIZE_LIMIT so
+    // the two scale together; explicit bytes override via INFLIGHT_BODY_BUDGET_BYTES.
     inflightBodyBudgetBytes: resolveInflightBodyBudgetBytes(
       process.env.INFLIGHT_BODY_BUDGET_BYTES,
       process.env.BODY_SIZE_LIMIT,
@@ -126,10 +129,12 @@ export default () => ({
 
   // Global message search. Opt-out via SEARCH_ENABLED=false. Provider defaults to 'auto' (the
   // built-in DB full-text provider — Postgres tsvector/GIN, SQLite FTS5); 'none' disables the
-  // /search route + module at runtime while keeping the config namespace loaded.
+  // /search route + module at runtime while keeping the config namespace loaded. match=contains is
+  // opt-in (SEARCH_CONTAINS_ENABLED=true): its trigram index costs about three times the message text.
   search: {
     enabled: process.env.SEARCH_ENABLED !== 'false',
     provider: process.env.SEARCH_PROVIDER || 'auto',
+    containsEnabled: process.env.SEARCH_CONTAINS_ENABLED === 'true',
   },
 
   // Dashboard statistics. The /stats aggregates run GROUP BY scans over the whole messages
@@ -285,31 +290,26 @@ export default () => ({
     // opt-out here — a 0-byte cap rejects every dispatch (a total webhook outage), and a NaN would
     // silently disable the cap (`payloadBytes > NaN` is always false). env.validation rejects
     // non-decimal / non-positive values at boot.
-    maxPayloadBytes: (() => {
-      const n = parseInt(process.env.WEBHOOK_MAX_PAYLOAD_BYTES ?? '', 10);
-      return Number.isFinite(n) && n > 0 ? n : 1024 * 1024;
-    })(),
+    maxPayloadBytes: positiveIntFromEnv('WEBHOOK_MAX_PAYLOAD_BYTES', 1024 * 1024),
     // Max webhooks registered per session. One inbound event fans out to every registered webhook
     // of the session, so an unbounded count multiplies per-event copies of the payload. Creating a
     // NEW webhook above the cap is rejected with 400; existing ones are grandfathered (never
     // deleted). Default 16; 0 disables the cap. Garbage falls back to the default.
-    maxPerSession: (() => {
-      const n = parseInt(process.env.WEBHOOK_MAX_PER_SESSION ?? '', 10);
-      return Number.isFinite(n) && n >= 0 ? n : 16;
-    })(),
+    maxPerSession: resolveNonNegativeIntEnv(process.env.WEBHOOK_MAX_PER_SESSION, 16),
     // Inline base64 media cap for webhook payloads (decoded bytes). A media blob larger than this
     // is replaced with the { omitted: true, sizeBytes } marker BEFORE the payload is cloned per
     // webhook / queued into Redis, so fan-out and failed-job retention never copy the blob. Media
     // at or under the cap stays inline (unchanged). Default 1 MiB; 0 = never inline media. Garbage
     // falls back to the default.
-    mediaInlineMaxBytes: (() => {
-      const n = parseInt(process.env.WEBHOOK_MEDIA_INLINE_MAX_BYTES ?? '', 10);
-      return Number.isFinite(n) && n >= 0 ? n : 1024 * 1024;
-    })(),
+    mediaInlineMaxBytes: resolveNonNegativeIntEnv(process.env.WEBHOOK_MEDIA_INLINE_MAX_BYTES, 1024 * 1024),
     // How long shutdown waits for in-flight direct deliveries to finish before abandoning them.
     // 0 = don't wait (explicit opt-out); blank/garbage falls back to the default — a NaN here would
     // silently remove the drain deadline downstream (Math.max(0, NaN) is NaN).
-    shutdownDrainMs: resolveNonNegativeIntEnv(process.env.WEBHOOK_SHUTDOWN_DRAIN_MS, 5000),
+    shutdownDrainMs: resolveNonNegativeIntEnv(process.env.WEBHOOK_SHUTDOWN_DRAIN_MS, DEFAULT_WEBHOOK_SHUTDOWN_DRAIN_MS),
+    // How long a terminal delivery-failure row keeps the event data it was built from, so
+    // `POST /webhooks/delivery-failures/redrive` can replay it. 0 (the default) stores nothing, which
+    // is the pre-redrive behaviour. The retention sweep nulls an expired payload and keeps the row.
+    failurePayloadRetentionHours: resolveNonNegativeIntEnv(process.env.WEBHOOK_FAILURE_PAYLOAD_RETENTION_HOURS, 0),
   },
 
   // API configuration
@@ -341,10 +341,7 @@ export default () => ({
     // may be trusted for client-IP resolution. Empty by default: X-Forwarded-For
     // is ignored and the direct socket address is used, preventing spoofing of
     // the API-key allowedIps whitelist.
-    trustedProxies: (process.env.TRUSTED_PROXIES || '')
-      .split(',')
-      .map(proxy => proxy.trim())
-      .filter(Boolean),
+    trustedProxies: parseTrustedProxies(process.env.TRUSTED_PROXIES),
   },
 
   // Plugin platform configuration
@@ -392,7 +389,8 @@ export default () => ({
     // fully-unauthenticated @Public() endpoint: once an instance is provisioned against it, anyone who can
     // reach the host can POST a forged payload that triggers outbound WhatsApp sends. Default off — only
     // set ALLOW_UNSIGNED_INGRESS=true for a provider that genuinely offers no HMAC, and front the route
-    // with a network/reverse-proxy ACL. Refused in production by the boot guard unless explicitly set.
+    // with a network/reverse-proxy ACL. With the flag off, the plugin loader refuses such a manifest in every
+    // environment (validateIngressManifest).
     allowUnsigned: process.env.ALLOW_UNSIGNED_INGRESS === 'true',
   },
 
@@ -425,8 +423,8 @@ export default () => ({
     archiveEnabled: process.env.CHAT_MEDIA_ARCHIVE_ENABLED === 'true',
     // Extend archiving to media this account SENT. A sub-flag rather than a mode of its own, so what
     // it writes lands under the same prefix and is maintained by the same retention purge and orphan
-    // sweep. Off by default because it doubles storage again for the outbound half, and because a
-    // URL-based send stores no bytes to archive in the first place.
+    // sweep. Off by default because it doubles storage again for the outbound half; a URL-based send
+    // stores no bytes to archive on Baileys, and on whatsapp-web.js the echo row may hold them.
     archiveOutbound: process.env.CHAT_MEDIA_ARCHIVE_OUTBOUND === 'true',
     // Per-file cap on archived chat media (default 25 MiB). Media above it is simply not archived —
     // the message row and its inline copy are unaffected.
@@ -451,6 +449,11 @@ export default () => ({
       const n = parseInt(process.env.CHAT_MEDIA_ORPHAN_GRACE_MS ?? '', 10);
       return Number.isFinite(n) && n > 0 ? n : 60 * 60 * 1000;
     })(),
+    // What happens to a row's inline base64 once its media is archived. 'inline' (the default) keeps
+    // it, as before. 'archive' replaces it with the omitted marker after the file is stored and
+    // verified, so the bytes live once, in the file store; reads go through the media route.
+    // Validated at boot to need CHAT_MEDIA_ARCHIVE_ENABLED=true.
+    inlineMode: process.env.MESSAGE_INLINE_MEDIA === 'archive' ? ('archive' as const) : ('inline' as const),
   },
 
   // Session ownership across processes. A session's engine runs in exactly one process; these

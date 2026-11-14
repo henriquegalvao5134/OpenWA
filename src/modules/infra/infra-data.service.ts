@@ -5,6 +5,9 @@ import { DataSource, QueryRunner } from 'typeorm';
 import { InjectDataSource } from '@nestjs/typeorm';
 import { createLogger } from '../../common/services/logger.service';
 import { isMissingTableError } from '../../common/utils/db-errors';
+import { closeSessionWrites } from '../../common/utils/session-write-scope';
+import { awaitNoOpenTransaction, SHARED_CONNECTION_DIALECTS } from '../../common/utils/shared-connection';
+import { failUnfinishedSessionBatches } from '../message/batch-media.util';
 import { AuditService } from '../audit/audit.service';
 import { AuditAction } from '../audit/entities/audit-log.entity';
 import { SessionService } from '../session/session.service';
@@ -15,12 +18,13 @@ import { ScopeBindingService } from '../integration/scope-binding.service';
 import { ReKeyChatStatesBySessionId1786500000000 } from '../../database/migrations/1786500000000-ReKeyChatStatesBySessionId';
 import { ScrubRevokedMessageContent1786900000000 } from '../../database/migrations/1786900000000-ScrubRevokedMessageContent';
 import { ScrubNonPhoneLidMappings1786950000000 } from '../../database/migrations/1786950000000-ScrubNonPhoneLidMappings';
+import { BackfillLegacyMessageTypes1791300000000 } from '../../database/migrations/1791300000000-BackfillLegacyMessageTypes';
 import { Session as SessionEntity, SessionStatus } from '../session/entities/session.entity';
 import { In } from 'typeorm';
 import { DateUtils } from 'typeorm/util/DateUtils';
 import type { MigrationTables, TableCounts } from './migration-tables.types';
 import { EXPORT_TABLES, EXPORT_TABLE_EXCLUSIONS, type AnyExportTable } from './export-tables';
-import { TABLE_IMPORTERS } from './table-importers';
+import { TABLE_IMPORTERS, deduplicateArchivedWebhookFailures } from './table-importers';
 
 /**
  * The ownership quartet SessionOwnershipService maintains: which process holds a session's engine and
@@ -146,13 +150,6 @@ export function toSqliteDatetime(value: unknown): unknown {
 }
 
 /**
- * Dialects where every TypeORM query runner shares ONE connection, so an open transaction is visible
- * to anything else querying in the same process. A positive list on purpose: a dialect nobody has
- * classified must not silently opt into suspending a safety mechanism.
- */
-const SHARED_CONNECTION_DIALECTS = new Set(['better-sqlite3', 'sqlite']);
-
-/**
  * Aggregate budget for the inline base64 media ONE export may carry, counted in the encoded bytes
  * that actually land in the JSON body. Override with EXPORT_INLINE_MEDIA_BUDGET_BYTES; 0 omits every
  * payload, and anything that is not a non-negative decimal integer falls back to the default.
@@ -247,6 +244,22 @@ export interface InfraExportDataResult {
   omittedInlineMedia: { messages: number; messageBatches: number };
 }
 
+function parsePluginInstanceConfig(raw: unknown): Record<string, unknown> | null {
+  if (typeof raw === 'string') {
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>)
+        : null;
+    } catch {
+      return null;
+    }
+  }
+  return typeof raw === 'object' && raw !== null && !Array.isArray(raw) ? (raw as Record<string, unknown>) : null;
+}
+
+const EMPTY_ARCHIVE_WARNING = 'Backup contained no rows to restore; refused to replace existing data. Check the file.';
+
 /** Result of POST /infra/import-data; InfraImportDataResponseDto is the published contract. */
 export interface InfraImportDataResult {
   imported: boolean;
@@ -260,7 +273,9 @@ export interface InfraImportDataResult {
   /**
    * True when an engine may still be writing into the restored tables, from any of three causes:
    * orphans deliberately left running (`force`), a `stopOrphans` teardown that failed, or sessions
-   * held by another node, which this request has no channel to stop. Restart to reconcile.
+   * held by another node, which this request has no channel to stop. Restart to reconcile those.
+   * Also true when the post-commit plugin binding re-sync failed; a restart does not repair that
+   * one, so its notice names the manual check instead.
    */
   restartRequired: boolean;
   /** Session ids with a running engine that the restored data no longer contains. */
@@ -413,7 +428,10 @@ export class InfraDataService {
       const droppedBefore = inlineMediaBudget.droppedPayloads();
       const rows: unknown[] = entry.inlineMedia
         ? await this.readInlineMediaTable(entry, entry.inlineMedia, sql => readTable(entry, sql), inlineMediaBudget)
-        : await readTable(entry, `SELECT * FROM ${entry.table}`);
+        : await readTable(
+            entry,
+            `SELECT ${entry.columns?.map(column => `"${column}"`).join(', ') ?? '*'} FROM ${entry.table}`,
+          );
       // `rows` was read for exactly this entry's table, so it holds the row type the entry's hooks
       // declare. That correlation is what the erased entry type cannot carry, and this loop is the
       // one place it is known — so the casts live here rather than at each hook.
@@ -579,6 +597,31 @@ export class InfraDataService {
       }
     }
 
+    // An archive with no rows is always refused (see the totalRestored check below), so refuse it here,
+    // before the orphan pre-flight: with no sessions in it every running engine reads as an orphan, and
+    // a stopOrphans retry would tear all of them down for a restore that was never going to happen.
+    // A row a skip guard vetoes is just as certain a rollback (see the warnings gate below), and the
+    // guards read only the archived tables, so run them here too. The in-transaction call stays as a backstop.
+    const refusals = TABLE_IMPORTERS.every(importer => !data.tables[importer.key]?.length)
+      ? [EMPTY_ARCHIVE_WARNING]
+      : TABLE_IMPORTERS.flatMap(importer =>
+          (data.tables[importer.key] ?? [])
+            .map((row, _index, rows) => importer.skip?.(row as never, rows as never))
+            .filter((warning): warning is string => warning != null),
+        );
+    if (refusals.length > 0) {
+      return {
+        imported: false,
+        counts: Object.fromEntries(TABLE_IMPORTERS.map(importer => [importer.key, 0] as const)) as TableCounts,
+        warnings: refusals,
+        notices: [],
+        restartRequired: false,
+        orphanedEngines: [],
+        stoppedOrphanEngines: [],
+        failedOrphanEngines: [],
+      };
+    }
+
     const importedSessionIds = new Set((data.tables.sessions ?? []).map(s => s.id));
     const orphanedEngines = (this.sessionService?.getActiveSessionIds() ?? []).filter(
       id => !importedSessionIds.has(id),
@@ -614,6 +657,14 @@ export class InfraDataService {
       const result = await this.sessionService.stopOrphanEngines(orphanedEngines);
       stoppedOrphanEngines = result.stopped;
       failedOrphanEngines = result.failed;
+      // The teardown cannot be rolled back, and the import's own audit row is written only for a committed
+      // restore, so each stopped session is recorded here: a refused or failed restore would leave no trace.
+      for (const sessionId of result.stopped) {
+        await this.auditService?.logInfo(AuditAction.SESSION_STOPPED, {
+          sessionId,
+          metadata: { via: 'infra_import_data' },
+        });
+      }
       if (failedOrphanEngines.length > 0) {
         // Teardown failed for at least one orphan. The Map entry is removed regardless (see
         // stopOrphanEngines), so the engine no longer holds a concurrency slot — but its underlying
@@ -625,12 +676,13 @@ export class InfraDataService {
             `(removed from the engine registry; a process restart guarantees cleanup).`,
         );
       }
-      // Engines still mid-initialization (no Map entry yet) are reported in notRunning: their start()
-      // self-aborts via the stop mark, but they are not counted as stopped here.
+      // Sessions with no engine yet are reported in notRunning: one still initializing aborts its start()
+      // on the stop mark, and one waiting to relaunch after a failed reconnect had its relaunch cancelled.
+      // Neither is counted as stopped here.
       if (result.notRunning.length > 0) {
         notices.push(
-          `${result.notRunning.length} orphan session(s) had no live engine yet (still initializing): ` +
-            `${result.notRunning.join(', ')} — their start() will self-abort.`,
+          `${result.notRunning.length} orphan session(s) had no live engine yet (initializing or waiting to ` +
+            `reconnect): ${result.notRunning.join(', ')}; they will not start.`,
         );
       }
     } else if (orphanedEngines.length > 0 && !data.force) {
@@ -683,6 +735,16 @@ export class InfraDataService {
     const sharesOneConnection = SHARED_CONNECTION_DIALECTS.has(this.dataDataSource.options.type);
     const resumeLossDetection = sharesOneConnection ? this.ownership?.suspendLossDetection() : undefined;
 
+    // The replace deletes every session the archive does not hold, rows and all, and messages has no foreign
+    // key to refuse a send or batch row that lands after it. So their write scopes are closed and drained
+    // before the transaction opens, as SessionEngineControls.delete does. Not for an engine force left
+    // running, which keeps writing (restartRequired says so), nor for one another node holds.
+    const leftRunning = new Set([...heldElsewhere, ...(data.stopOrphans ? [] : orphanedEngines)]);
+    let retired: Array<{ id: string; writes: ReturnType<typeof closeSessionWrites> }> = [];
+    let committed = false;
+    // Set when another transaction opened on the shared connection while the writes drained.
+    let foreignTransaction = false;
+
     // Everything from here is wrapped so the token cannot outlive this request. It is not enough to
     // release it in the transaction's own finally: createQueryRunner/connect/startTransaction sit
     // before that finally exists, so any throw there — a driver change, a broadcaster subscriber, a
@@ -691,7 +753,6 @@ export class InfraDataService {
     // silently, which is strictly worse than the teardown the suspension prevents.
     try {
       const queryRunner = this.dataDataSource.createQueryRunner();
-      await queryRunner.connect();
 
       // Refuse BEFORE a single row is deleted, not after. On better-sqlite3 every query runner is a
       // driver SINGLETON, so if anything else already holds a transaction on this DataSource — a
@@ -704,22 +765,63 @@ export class InfraDataService {
       // deleted every row — including any the enclosing transaction just wrote. Refusing up front is
       // the only answer that is both honest and non-destructive. On Postgres each runner gets its own
       // pooled client, so this is always false there and the check costs nothing.
-      if (queryRunner.isTransactionActive) {
-        throw new ConflictException({
-          statusCode: 409,
-          error: 'Conflict',
-          message:
-            'Another database transaction is in progress on this connection, so a restore could not be ' +
-            'made durable. Retry with no other data operation in flight.',
-          code: 'IMPORT_NESTED_TRANSACTION',
-        });
+      //
+      // The try/finally that releases the runner opens only after BEGIN, so the refusal and a failing
+      // BEGIN give the runner back here: a pooled PostgreSQL client would otherwise stay checked out for
+      // the life of the process.
+      const refuseNestedTransaction = (): void => {
+        if (queryRunner.isTransactionActive) {
+          throw new ConflictException({
+            statusCode: 409,
+            error: 'Conflict',
+            message:
+              'Another database transaction is in progress on this connection, so a restore could not be ' +
+              'made durable. Retry with no other data operation in flight.',
+            code: 'IMPORT_NESTED_TRANSACTION',
+          });
+        }
+      };
+      try {
+        refuseNestedTransaction();
+        // Drained before BEGIN: on SQLite a write still in flight would otherwise join this transaction. And
+        // before this runner takes a pooled client on PostgreSQL, where the write may still need one: with a
+        // pool of one it would wait for the import while the import waits for it. So the ids are read on a
+        // client that goes back at once there; on SQLite this runner is the one connection anyway.
+        const existing = await this.dataDataSource.query<Array<{ id: string }>>(
+          'SELECT id FROM sessions',
+          [],
+          sharesOneConnection ? queryRunner : undefined,
+        );
+        retired = existing
+          .filter(({ id }) => !importedSessionIds.has(id) && !leftRunning.has(id))
+          .map(({ id }) => ({ id, writes: closeSessionWrites(this.dataDataSource, id) }));
+        await Promise.all(retired.map(({ writes }) => writes.drain()));
+        await queryRunner.connect();
+        // Again after the drain's await: BEGIN must follow the check with nothing in between.
+        if (queryRunner.isTransactionActive) foreignTransaction = true;
+        refuseNestedTransaction();
+        await queryRunner.startTransaction();
+      } catch (error) {
+        await queryRunner.release().catch(() => undefined);
+        throw error;
       }
 
-      // startTransaction is inside the runner's own try/finally, so a throw from it still releases
-      // the runner instead of stranding it for the life of the process.
-      await queryRunner.startTransaction();
-
       try {
+        const isPostgres = this.dataDataSource.options.type === 'postgres';
+        if (isPostgres) {
+          // The runtime pool carries a statement_timeout sized for request traffic (30 s by default), but
+          // the clears and scrubs below scale with the live tables, not with the archive: restoring an
+          // earlier export onto an instance whose messages table has since grown to millions of rows
+          // would be cancelled mid-DELETE, after the engines of the sessions it drops were already
+          // stopped. Lifted for this transaction only, as the migrations do. A lock wait keeps the bound
+          // the statement timeout gave it, so a stuck lock still fails the import instead of hanging it.
+          const lockWaitMs = Math.max(
+            0,
+            Math.trunc(this.configService.get<number>('dataDatabase.statementTimeoutMs', 30000)) || 0,
+          );
+          await queryRunner.query('SET LOCAL statement_timeout = 0');
+          await queryRunner.query(`SET LOCAL lock_timeout = ${lockWaitMs}`);
+        }
         // Clear existing data (in correct order due to foreign keys). templates and
         // baileys_stored_messages FK sessions ON DELETE CASCADE, so the sessions DELETE would clear
         // them too; clearing them explicitly first keeps the order correct on engines where the
@@ -727,11 +829,17 @@ export class InfraDataService {
         // OTHER failure (lock, I/O, aborted tx) propagate to the transaction rollback below — a blind
         // `.catch(() => {})` here could otherwise silently commit a MERGED (not replaced) restore on
         // SQLite, violating the endpoint's "replaces existing data" contract.
-        const clearTable = async (table: string): Promise<void> => {
+        const clearTable = async (table: string, where = ''): Promise<void> => {
+          // Asked first on PostgreSQL: a statement that names a missing relation aborts the whole transaction even
+          // when its error is caught, and every later statement then fails with 25P02.
+          if (isPostgres && !(await queryRunner.hasTable(table))) {
+            this.logger.debug('Skipped clearing a table that does not exist during import', { table });
+            return;
+          }
           try {
-            await queryRunner.query(`DELETE FROM ${table}`);
+            await queryRunner.query(`DELETE FROM ${table}${where}`);
           } catch (err) {
-            if (!isMissingTableError(err)) throw err;
+            if (isPostgres || !isMissingTableError(err)) throw err;
             this.logger.debug('Skipped clearing a table that does not exist during import', { table });
           }
         };
@@ -741,7 +849,6 @@ export class InfraDataService {
         // and strict binding rejects booleans/undefined — which a Postgres-made backup carries (real
         // booleans survive the JSON round-trip). Postgres needs `$N` and binds booleans natively, so both
         // rewrites apply only on the SQLite path. Safe: every `$N` below occurs once, in ascending order.
-        const isPostgres = this.dataDataSource.options.type === 'postgres';
         const insert = (text: string, params: unknown[]): Promise<unknown> =>
           queryRunner.query(
             isPostgres ? text : text.replace(/\$\d+/g, '?'),
@@ -765,12 +872,20 @@ export class InfraDataService {
         // transaction, and a missing table is tolerated by clearTable below.
         const previousPluginBindings = (await queryRunner.hasTable('plugin_instances'))
           ? (
-              (await queryRunner.query('SELECT "pluginId", "sessionScope", enabled FROM plugin_instances')) as Array<{
+              (await queryRunner.query(
+                'SELECT "pluginId", "instanceId", "sessionScope", enabled, config FROM plugin_instances',
+              )) as Array<{
                 pluginId: string;
+                instanceId?: string;
                 sessionScope: string | null;
                 enabled: boolean | number;
+                config?: unknown;
               }>
-            ).map(row => ({ ...row, enabled: Number(row.enabled) === 1 }))
+            ).map(row => ({
+              ...row,
+              enabled: Number(row.enabled) === 1,
+              config: parsePluginInstanceConfig(row.config),
+            }))
           : [];
         // Integration Fabric + both DLQs: none carry an FK constraint to sessions (sessionId is provenance),
         // so clearing them here before the sessions DELETE keeps the replace-semantics complete.
@@ -816,7 +931,10 @@ export class InfraDataService {
         // PostgreSQL-made backup compares and sorts like rows the app wrote itself.
         const datetimeColumns = isPostgres ? undefined : sqliteDatetimeColumns(this.dataDataSource);
         restore: for (const importer of TABLE_IMPORTERS) {
-          const rows = data.tables[importer.key];
+          const rows =
+            importer.key === 'webhookDeliveryFailures'
+              ? deduplicateArchivedWebhookFailures(data.tables.webhookDeliveryFailures ?? [])
+              : data.tables[importer.key];
           if (!rows?.length) continue;
           const dateColumns = datetimeColumns?.get(importer.key) ?? [];
           for (const archivedRow of rows) {
@@ -834,7 +952,7 @@ export class InfraDataService {
             // cannot carry, and this loop is the one place it is known — so the cast lives here rather
             // than at each of the three uses below.
             const row = untypedRow as never;
-            const skipWarning = importer.skip?.(row);
+            const skipWarning = importer.skip?.(row, rows as never);
             if (skipWarning != null) {
               warnings.push(skipWarning);
               continue;
@@ -894,8 +1012,32 @@ export class InfraDataService {
           try {
             await ScrubRevokedMessageContent1786900000000.scrub(queryRunner);
             await ScrubNonPhoneLidMappings1786950000000.scrub(queryRunner);
+            // An archive taken before the neutral message vocabulary restores the raw wwebjs tokens, which
+            // the boot-time backfill no longer converts on a migration-managed database.
+            await BackfillLegacyMessageTypes1791300000000.backfill(queryRunner);
           } catch (error) {
             warnings.push(`Failed to clean restored rows: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+
+        // send_idempotency_keys is not archived, so it is trimmed rather than cleared. A claim of a session
+        // this restore dropped would outlive it by up to 24 h, and a later restore that brings the id back
+        // would answer a retried send with the old stored response instead of sending it. The claims of a
+        // session the restore keeps stay: a retry of a send made before the restore still replays.
+        // Asked first rather than caught: on PostgreSQL a statement that fails, a missing table included,
+        // aborts the whole import transaction, and every later statement then fails with it.
+        if (warnings.length === 0 && (await queryRunner.hasTable('send_idempotency_keys'))) {
+          try {
+            // CAST: sessions.id is a uuid on PostgreSQL and the claim's sessionId a varchar, which `IN` does not
+            // compare.
+            await clearTable(
+              'send_idempotency_keys',
+              ' WHERE "sessionId" NOT IN (SELECT CAST("id" AS TEXT) FROM sessions)',
+            );
+          } catch (error) {
+            warnings.push(
+              `Failed to drop the send idempotency claims of removed sessions: ${error instanceof Error ? error.message : String(error)}`,
+            );
           }
         }
 
@@ -949,20 +1091,21 @@ export class InfraDataService {
         }
 
         // A wrong/empty/garbage backup file restores zero rows but the DELETE already ran — committing
-        // would silently WIPE the database and report success. Refuse it and roll back instead. (#488 review)
+        // would silently WIPE the database and report success. Refuse it and roll back instead. (#488)
         const totalRestored = Object.values(counts).reduce((sum, n) => sum + n, 0);
         if (totalRestored === 0) {
           await queryRunner.rollbackTransaction();
           return {
             imported: false,
             counts,
-            warnings: ['Backup contained no rows to restore; refused to replace existing data. Check the file.'],
+            warnings: [EMPTY_ARCHIVE_WARNING],
             notices,
             ...engineStateAfterRollback,
           };
         }
 
         await queryRunner.commitTransaction();
+        committed = true;
 
         // Runtime reconciliation, part 2 (post-commit): the in-memory lid->phone mirror was warmed from
         // the OLD lid_mappings rows and is write-through only, so the just-restored table would never
@@ -986,7 +1129,8 @@ export class InfraDataService {
             notices.push(
               `Plugin instance bindings could not be re-applied after the restore ` +
                 `(${error instanceof Error ? error.message : String(error)}): check each plugin's active sessions ` +
-                `and per-session config (GET /api/plugins/:id, PUT /api/plugins/:id/sessions) against its restored instances.`,
+                `and per-session config (GET /api/plugins/:id, PUT /api/plugins/:id/sessions) against its restored instances, ` +
+                `and its base config for a secret a dropped session-wide instance left behind (PUT /api/plugins/:id/config).`,
             );
           }
         }
@@ -1019,6 +1163,29 @@ export class InfraDataService {
         await queryRunner.release();
       }
     } finally {
+      // A restore that did not commit keeps those sessions, but a batch run that captured their writes before
+      // the close stays stopped, so its row is failed before the release, as a failed delete does. Their
+      // engines are gone, so the batch could not have sent anyway. Not inside a transaction another caller
+      // opened on the shared connection while the writes drained: the fail would roll back with it.
+      if (foreignTransaction && retired.length > 0 && !(await awaitNoOpenTransaction(this.dataDataSource))) {
+        this.logger.warn('Failing the unfinished batches of a refused import inside another open transaction', {
+          action: 'infra_import_foreign_transaction_open',
+          sessionIds: retired.map(({ id }) => id),
+        });
+      }
+      for (const { id } of committed ? [] : retired) {
+        await failUnfinishedSessionBatches(this.dataDataSource, id).catch((error: unknown) =>
+          this.logger.warn(
+            `Could not fail the unfinished batches of session ${id} after an import that did not commit`,
+            {
+              sessionId: id,
+              action: 'infra_import_batch_fail_failed',
+              error: error instanceof Error ? error.message : String(error),
+            },
+          ),
+        );
+      }
+      for (const { writes } of retired) writes.release();
       // Its own finally, so a throwing release() cannot strand the token either.
       resumeLossDetection?.();
     }

@@ -32,7 +32,10 @@ public record UpdateWebhookRequest(
             return this;
         }
 
-        /** Events to subscribe to. Use {@link WebhookEvent#ALL} to receive all. */
+        /**
+         * Events to subscribe to. Use {@link WebhookEvent#ALL} to receive all except
+         * {@link WebhookEvent#MESSAGE_RECEIPT}, which must be named.
+         */
         public Builder events(List<WebhookEvent> v) {
             this.events = v;
             return this;
@@ -63,7 +66,10 @@ public record UpdateWebhookRequest(
             return this;
         }
 
-        /** 0–5; default 3. Server DTO field is {@code retryCount}. */
+        /**
+         * Total delivery attempts per event including the first, 0 to 5 (0 and 1 both mean one
+         * attempt); omit to keep the current value. Server DTO field is {@code retryCount}.
+         */
         public Builder retryCount(Integer v) {
             this.retryCount = v;
             return this;
