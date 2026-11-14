@@ -1,26 +1,22 @@
 diff --git a/dashboard/src/components/Layout.tsx b/dashboard/src/components/Layout.tsx
-index 866d6ddb6..16ac29be4 100644
+index 866d6ddb6..51cd6c3da 100644
 --- a/dashboard/src/components/Layout.tsx
 +++ b/dashboard/src/components/Layout.tsx
-@@ -230,7 +230,9 @@ export function Layout({ onLogout, userRole }: LayoutProps) {
+@@ -230,7 +230,7 @@ export function Layout({ onLogout, userRole }: LayoutProps) {
              {isMobileOpen ? <X size={24} /> : <Menu size={24} />}
            </button>
            <div className="mobile-brand">
 -            <img src="/openwa_logo.webp" alt="OpenWA" className="sidebar-logo" />
-+            <svg className="sidebar-logo" viewBox="0 0 48 20" xmlns="http://www.w3.org/2000/svg" aria-label="GD3">
-+              <text x="0" y="16" fontFamily="system-ui,-apple-system,sans-serif" fontWeight="700" fontSize="16" fill="currentColor" letterSpacing="-0.5">GD3</text>
-+            </svg>
++            <img src="/autogtech-icon.png" alt="AutoG Tech" className="sidebar-logo" />
              <span className="brand-name">{t('common.appName')}</span>
            </div>
            <div style={{ width: 40 }} />
-@@ -245,7 +247,9 @@ export function Layout({ onLogout, userRole }: LayoutProps) {
+@@ -245,7 +245,7 @@ export function Layout({ onLogout, userRole }: LayoutProps) {
          inert={isMobile && !isMobileOpen}
        >
          <div className="sidebar-header">
 -          <img src="/openwa_logo.webp" alt="OpenWA" className="sidebar-logo" />
-+          <svg className="sidebar-logo" viewBox="0 0 48 20" xmlns="http://www.w3.org/2000/svg" aria-label="GD3">
-+            <text x="0" y="16" fontFamily="system-ui,-apple-system,sans-serif" fontWeight="700" fontSize="16" fill="currentColor" letterSpacing="-0.5">GD3</text>
-+          </svg>
++          <img src="/autogtech-icon.png" alt="AutoG Tech" className="sidebar-logo" />
            {!collapsed && (
              <div className="sidebar-brand">
                <span className="brand-name">{t('common.appName')}</span>
@@ -37,7 +33,7 @@ index ba2fbea4f..188e3d277 100644
      <div
        className="room-messages"
 diff --git a/dashboard/src/hooks/useDocumentTitle.ts b/dashboard/src/hooks/useDocumentTitle.ts
-index 1c5242039..842957656 100644
+index 1c5242039..7b88482cc 100644
 --- a/dashboard/src/hooks/useDocumentTitle.ts
 +++ b/dashboard/src/hooks/useDocumentTitle.ts
 @@ -7,7 +7,7 @@ import { useEffect } from 'react';
@@ -45,12 +41,12 @@ index 1c5242039..842957656 100644
    useEffect(() => {
      const previousTitle = document.title;
 -    document.title = `${title} | OpenWA`;
-+    document.title = `${title} | GD3`;
++    document.title = `${title} | AutoG Tech`;
  
      return () => {
        document.title = previousTitle;
 diff --git a/dashboard/src/i18n/locales/en.json b/dashboard/src/i18n/locales/en.json
-index 62e65add4..852ce64ce 100644
+index 62e65add4..5e4cddb87 100644
 --- a/dashboard/src/i18n/locales/en.json
 +++ b/dashboard/src/i18n/locales/en.json
 @@ -6,7 +6,7 @@
@@ -58,7 +54,7 @@ index 62e65add4..852ce64ce 100644
    },
    "common": {
 -    "appName": "OpenWA",
-+    "appName": "GD3",
++    "appName": "AutoG Tech",
      "updateAvailable": "v{{version}} available",
      "loading": "Loading...",
      "cancel": "Cancel",
@@ -81,7 +77,7 @@ index 62e65add4..852ce64ce 100644
    },
    "dashboard": {
 diff --git a/dashboard/src/i18n/locales/pt-BR.json b/dashboard/src/i18n/locales/pt-BR.json
-index 91af1b6fa..ef5a02548 100644
+index 91af1b6fa..18852c5dd 100644
 --- a/dashboard/src/i18n/locales/pt-BR.json
 +++ b/dashboard/src/i18n/locales/pt-BR.json
 @@ -6,7 +6,7 @@
@@ -89,7 +85,7 @@ index 91af1b6fa..ef5a02548 100644
    },
    "common": {
 -    "appName": "OpenWA",
-+    "appName": "GD3",
++    "appName": "AutoG Tech",
      "updateAvailable": "v{{version}} disponível",
      "loading": "Carregando...",
      "cancel": "Cancelar",
@@ -112,7 +108,7 @@ index 91af1b6fa..ef5a02548 100644
    },
    "dashboard": {
 diff --git a/dashboard/src/pages/Login.tsx b/dashboard/src/pages/Login.tsx
-index e90579739..200804723 100644
+index e90579739..fab9474b0 100644
 --- a/dashboard/src/pages/Login.tsx
 +++ b/dashboard/src/pages/Login.tsx
 @@ -1,7 +1,6 @@
@@ -123,18 +119,16 @@ index e90579739..200804723 100644
  import { CustomSelect } from '../components/CustomSelect';
  import { languageOptions, resolveSupportedLanguage, type SupportedLanguage } from '../i18n';
  import { API_BASE_URL } from '../services/api';
-@@ -79,7 +78,9 @@ export function Login({ onLogin }: LoginProps) {
+@@ -79,7 +78,7 @@ export function Login({ onLogin }: LoginProps) {
      <div className="login-container">
        <div className="login-card">
          <div className="login-logo">
 -          <img src="/openwa_logo.webp" alt="OpenWA" className="logo-icon" />
-+          <svg className="logo-icon" viewBox="0 0 80 32" xmlns="http://www.w3.org/2000/svg" aria-label="GD3">
-+            <text x="0" y="26" fontFamily="system-ui,-apple-system,sans-serif" fontWeight="700" fontSize="26" fill="currentColor" letterSpacing="-1">GD3</text>
-+          </svg>
++          <img src="/autogtech-logo.png" alt="AutoG Tech" className="logo-icon" />
            <span className="version-info">
              {t('login.version', {
                version: __APP_VERSION__,
-@@ -135,25 +136,10 @@ export function Login({ onLogin }: LoginProps) {
+@@ -135,25 +134,10 @@ export function Login({ onLogin }: LoginProps) {
            </button>
          </form>
  
