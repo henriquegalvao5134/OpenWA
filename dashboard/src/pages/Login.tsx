@@ -78,9 +78,7 @@ export function Login({ onLogin }: LoginProps) {
     <div className="login-container">
       <div className="login-card">
         <div className="login-logo">
-          <svg className="logo-icon" viewBox="0 0 80 32" xmlns="http://www.w3.org/2000/svg" aria-label="GD3">
-            <text x="0" y="26" fontFamily="system-ui,-apple-system,sans-serif" fontWeight="700" fontSize="26" fill="currentColor" letterSpacing="-1">GD3</text>
-          </svg>
+          <img src="/autogtech-logo.png" alt="AutoG Tech" className="logo-icon" />
           <span className="version-info">
             {t('login.version', {
               version: __APP_VERSION__,

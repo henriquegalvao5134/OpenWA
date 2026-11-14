@@ -6,7 +6,7 @@
     }
   },
   "common": {
-    "appName": "GD3",
+    "appName": "AutoG Tech",
     "updateAvailable": "v{{version}} available",
     "loading": "Loading...",
     "cancel": "Cancel",

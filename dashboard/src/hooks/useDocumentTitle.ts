@@ -7,7 +7,7 @@ import { useEffect } from 'react';
 export function useDocumentTitle(title: string) {
   useEffect(() => {
     const previousTitle = document.title;
-    document.title = `${title} | GD3`;
+    document.title = `${title} | AutoG Tech`;
 
     return () => {
       document.title = previousTitle;

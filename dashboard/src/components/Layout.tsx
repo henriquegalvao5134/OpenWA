@@ -230,9 +230,7 @@ export function Layout({ onLogout, userRole }: LayoutProps) {
             {isMobileOpen ? <X size={24} /> : <Menu size={24} />}
           </button>
           <div className="mobile-brand">
-            <svg className="sidebar-logo" viewBox="0 0 48 20" xmlns="http://www.w3.org/2000/svg" aria-label="GD3">
-              <text x="0" y="16" fontFamily="system-ui,-apple-system,sans-serif" fontWeight="700" fontSize="16" fill="currentColor" letterSpacing="-0.5">GD3</text>
-            </svg>
+            <img src="/autogtech-icon.png" alt="AutoG Tech" className="sidebar-logo" />
             <span className="brand-name">{t('common.appName')}</span>
           </div>
           <div style={{ width: 40 }} />
@@ -247,9 +245,7 @@ export function Layout({ onLogout, userRole }: LayoutProps) {
         inert={isMobile && !isMobileOpen}
       >
         <div className="sidebar-header">
-          <svg className="sidebar-logo" viewBox="0 0 48 20" xmlns="http://www.w3.org/2000/svg" aria-label="GD3">
-            <text x="0" y="16" fontFamily="system-ui,-apple-system,sans-serif" fontWeight="700" fontSize="16" fill="currentColor" letterSpacing="-0.5">GD3</text>
-          </svg>
+          <img src="/autogtech-icon.png" alt="AutoG Tech" className="sidebar-logo" />
           {!collapsed && (
             <div className="sidebar-brand">
               <span className="brand-name">{t('common.appName')}</span>
