@@ -160,3 +160,69 @@ index e90579739..200804723 100644
        </footer>
      </div>
    );
+diff --git a/src/engine/adapters/message-mapper.ts b/src/engine/adapters/message-mapper.ts
+index 243065e00..0448e37ba 100644
+--- a/src/engine/adapters/message-mapper.ts
++++ b/src/engine/adapters/message-mapper.ts
+@@ -97,7 +97,23 @@ export interface RawMessageFields {
+   isForwarded?: boolean;
+   forwardingScore?: number;
+   /** Raw wwebjs payload; `notifyName` carries the sender's push name without an extra lookup. */
+-  _data?: { notifyName?: string; ephemeralDuration?: number };
++  _data?: {
++    notifyName?: string;
++    ephemeralDuration?: number;
++    /**
++     * WhatsApp ContextInfo, present when the message carries ad referral metadata.
++     * `externalAdReply.ctwaClid` is set on the first message from a lead who clicked a
++     * Click-to-WhatsApp ad (proto field ExternalAdReplyInfo.ctwaClid = 13).
++     */
++    contextInfo?: {
++      externalAdReply?: {
++        ctwaClid?: string | null;
++        sourceUrl?: string | null;
++        sourceType?: string | null;
++        title?: string | null;
++      };
++    };
++  };
+   /** Set on `order` messages: the placed order's id, and the single-order token that unlocks its items. */
+   orderId?: string;
+   token?: string;
+@@ -181,6 +197,15 @@ export function buildIncomingMessageBase(msg: RawMessageFields): IncomingMessage
+     incoming.ephemeralDuration = msg._data.ephemeralDuration;
+   }
+ 
++  // Click-to-WhatsApp attribution: ctwaClid is embedded in the first message of a lead who
++  // clicked a Meta Click-to-WhatsApp ad. It lives in contextInfo.externalAdReply.ctwaClid
++  // (ExternalAdReplyInfo proto field 13). Null is treated as absent — only a non-empty string
++  // carries attribution value.
++  const ctwaClid = msg._data?.contextInfo?.externalAdReply?.ctwaClid;
++  if (ctwaClid) {
++    incoming.ctwaClid = ctwaClid;
++  }
++
+   // Commerce ids, keyed off the mapped type so a stray `title` on some other message shape cannot
+   // fabricate a product. Without the id neither entry is actionable, so both are then left unset.
+   if (incoming.type === 'order' && msg.orderId) {
+diff --git a/src/engine/interfaces/whatsapp-engine.interface.ts b/src/engine/interfaces/whatsapp-engine.interface.ts
+index d75fafa0d..c69fec860 100644
+--- a/src/engine/interfaces/whatsapp-engine.interface.ts
++++ b/src/engine/interfaces/whatsapp-engine.interface.ts
+@@ -202,6 +202,16 @@ export interface IncomingMessage {
+   senderPhone?: string | null;
+   /** Sender contact info, best-effort from the WhatsApp Web cache. Sync fields only (no network). */
+   contact?: MessageContact;
++  /**
++   * Click-to-WhatsApp attribution ID (`ctwaClid` in the WhatsApp proto). Present only on the
++   * first message from a lead who clicked a Meta Click-to-WhatsApp ad. Use this to attribute
++   * the conversation — and any resulting purchase — back to the exact Meta ad via CAPI with
++   * `action_source: "business_messaging"` and `messaging_channel: "whatsapp"`.
++   *
++   * Source: `ContextInfo.externalAdReply.ctwaClid` (proto field 13 of ExternalAdReplyInfo).
++   * Populated by whatsapp-web.js adapter via `_data.contextInfo.externalAdReply.ctwaClid`.
++   */
++  ctwaClid?: string;
+   /** Styling of a text status/story: background as `#RRGGBB`. Only set by engines that expose it. */
+   backgroundColor?: string;
+   /** Styling of a text status/story: the WhatsApp font index. Only set by engines that expose it. */
