@@ -1,0 +1,162 @@
+diff --git a/dashboard/src/components/Layout.tsx b/dashboard/src/components/Layout.tsx
+index 866d6ddb6..16ac29be4 100644
+--- a/dashboard/src/components/Layout.tsx
++++ b/dashboard/src/components/Layout.tsx
+@@ -230,7 +230,9 @@ export function Layout({ onLogout, userRole }: LayoutProps) {
+             {isMobileOpen ? <X size={24} /> : <Menu size={24} />}
+           </button>
+           <div className="mobile-brand">
+-            <img src="/openwa_logo.webp" alt="OpenWA" className="sidebar-logo" />
++            <svg className="sidebar-logo" viewBox="0 0 48 20" xmlns="http://www.w3.org/2000/svg" aria-label="GD3">
++              <text x="0" y="16" fontFamily="system-ui,-apple-system,sans-serif" fontWeight="700" fontSize="16" fill="currentColor" letterSpacing="-0.5">GD3</text>
++            </svg>
+             <span className="brand-name">{t('common.appName')}</span>
+           </div>
+           <div style={{ width: 40 }} />
+@@ -245,7 +247,9 @@ export function Layout({ onLogout, userRole }: LayoutProps) {
+         inert={isMobile && !isMobileOpen}
+       >
+         <div className="sidebar-header">
+-          <img src="/openwa_logo.webp" alt="OpenWA" className="sidebar-logo" />
++          <svg className="sidebar-logo" viewBox="0 0 48 20" xmlns="http://www.w3.org/2000/svg" aria-label="GD3">
++            <text x="0" y="16" fontFamily="system-ui,-apple-system,sans-serif" fontWeight="700" fontSize="16" fill="currentColor" letterSpacing="-0.5">GD3</text>
++          </svg>
+           {!collapsed && (
+             <div className="sidebar-brand">
+               <span className="brand-name">{t('common.appName')}</span>
+diff --git a/dashboard/src/components/chats/ChatThread.tsx b/dashboard/src/components/chats/ChatThread.tsx
+index ba2fbea4f..188e3d277 100644
+--- a/dashboard/src/components/chats/ChatThread.tsx
++++ b/dashboard/src/components/chats/ChatThread.tsx
+@@ -448,6 +448,7 @@ function ChatThread({
+     });
+   };
+ 
++
+   return (
+     <div
+       className="room-messages"
+diff --git a/dashboard/src/hooks/useDocumentTitle.ts b/dashboard/src/hooks/useDocumentTitle.ts
+index 1c5242039..842957656 100644
+--- a/dashboard/src/hooks/useDocumentTitle.ts
++++ b/dashboard/src/hooks/useDocumentTitle.ts
+@@ -7,7 +7,7 @@ import { useEffect } from 'react';
+ export function useDocumentTitle(title: string) {
+   useEffect(() => {
+     const previousTitle = document.title;
+-    document.title = `${title} | OpenWA`;
++    document.title = `${title} | GD3`;
+ 
+     return () => {
+       document.title = previousTitle;
+diff --git a/dashboard/src/i18n/locales/en.json b/dashboard/src/i18n/locales/en.json
+index 62e65add4..852ce64ce 100644
+--- a/dashboard/src/i18n/locales/en.json
++++ b/dashboard/src/i18n/locales/en.json
+@@ -6,7 +6,7 @@
+     }
+   },
+   "common": {
+-    "appName": "OpenWA",
++    "appName": "GD3",
+     "updateAvailable": "v{{version}} available",
+     "loading": "Loading...",
+     "cancel": "Cancel",
+@@ -138,6 +138,8 @@
+     "placeholderTitle": "Start messaging",
+     "placeholderDesc": "Choose a conversation to read and reply.",
+     "scrollToBottom": "Scroll to latest",
++    "dateToday": "Today",
++    "dateYesterday": "Yesterday",
+     "groupSubtitle": "Group",
+     "privateContactSubtitle": "Private contact",
+     "deleteConfirm": "Delete this message for everyone?",
+@@ -370,7 +372,7 @@
+     "connectionError": "Unable to connect to server. Please try again.",
+     "help": "Need help?",
+     "viewDocs": "View Documentation",
+-    "footer": "Made with ❤️ by Yudhi Armyndharis and the OpenWA Community",
++    "footer": "GD3 Marketing Digital",
+     "version": "v{{version}} · {{date}}"
+   },
+   "dashboard": {
+diff --git a/dashboard/src/i18n/locales/pt-BR.json b/dashboard/src/i18n/locales/pt-BR.json
+index 91af1b6fa..ef5a02548 100644
+--- a/dashboard/src/i18n/locales/pt-BR.json
++++ b/dashboard/src/i18n/locales/pt-BR.json
+@@ -6,7 +6,7 @@
+     }
+   },
+   "common": {
+-    "appName": "OpenWA",
++    "appName": "GD3",
+     "updateAvailable": "v{{version}} disponível",
+     "loading": "Carregando...",
+     "cancel": "Cancelar",
+@@ -141,6 +141,8 @@
+     "placeholderTitle": "Comece a digitar",
+     "placeholderDesc": "Selecione um chat ativo na barra lateral esquerda para ler e enviar mensagens do WhatsApp.",
+     "scrollToBottom": "Ir para a mais recente",
++    "dateToday": "Hoje",
++    "dateYesterday": "Ontem",
+     "groupSubtitle": "Grupo",
+     "privateContactSubtitle": "Contato privado",
+     "deleteConfirm": "Excluir esta mensagem para todos?",
+@@ -375,7 +377,7 @@
+     "connectionError": "Não foi possível conectar ao servidor. Por favor, tente novamente.",
+     "help": "Precisa de ajuda?",
+     "viewDocs": "Ver documentação",
+-    "footer": "Feito com ❤️ por Yudhi Armyndharis e a comunidade OpenWA",
++    "footer": "GD3 Marketing Digital",
+     "version": "v{{version}} · {{date}}"
+   },
+   "dashboard": {
+diff --git a/dashboard/src/pages/Login.tsx b/dashboard/src/pages/Login.tsx
+index e90579739..200804723 100644
+--- a/dashboard/src/pages/Login.tsx
++++ b/dashboard/src/pages/Login.tsx
+@@ -1,7 +1,6 @@
+ import { useState } from 'react';
+ import { useTranslation } from 'react-i18next';
+ import { Eye, EyeOff, Languages } from 'lucide-react';
+-import { GithubIcon } from '../components/GithubIcon';
+ import { CustomSelect } from '../components/CustomSelect';
+ import { languageOptions, resolveSupportedLanguage, type SupportedLanguage } from '../i18n';
+ import { API_BASE_URL } from '../services/api';
+@@ -79,7 +78,9 @@ export function Login({ onLogin }: LoginProps) {
+     <div className="login-container">
+       <div className="login-card">
+         <div className="login-logo">
+-          <img src="/openwa_logo.webp" alt="OpenWA" className="logo-icon" />
++          <svg className="logo-icon" viewBox="0 0 80 32" xmlns="http://www.w3.org/2000/svg" aria-label="GD3">
++            <text x="0" y="26" fontFamily="system-ui,-apple-system,sans-serif" fontWeight="700" fontSize="26" fill="currentColor" letterSpacing="-1">GD3</text>
++          </svg>
+           <span className="version-info">
+             {t('login.version', {
+               version: __APP_VERSION__,
+@@ -135,25 +136,10 @@ export function Login({ onLogin }: LoginProps) {
+           </button>
+         </form>
+ 
+-        <p className="login-help">
+-          {t('login.help')}{' '}
+-          <a href="https://docs.open-wa.org" target="_blank" rel="noopener noreferrer">
+-            {t('login.viewDocs')}
+-          </a>
+-        </p>
+       </div>
+ 
+       <footer className="login-footer">
+         <span>{t('login.footer')}</span>
+-        <a
+-          href="https://github.com/rmyndharis/OpenWA"
+-          target="_blank"
+-          rel="noopener noreferrer"
+-          className="github-link"
+-          aria-label="GitHub"
+-        >
+-          <GithubIcon size={18} />
+-        </a>
+       </footer>
+     </div>
+   );
