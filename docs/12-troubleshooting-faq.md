@@ -277,7 +277,7 @@ initialization deadline, without it.
 
 **Cause:** WhatsApp added a passkey (WebAuthn) step to its companion linking handshake for some
 accounts. That step is enforced server-side inside the linking frames, which live in the engine
-libraries; neither whatsapp-web.js 1.34.7 nor Baileys 7.0.0-rc14 implements it, and OpenWA passes the
+libraries; neither whatsapp-web.js 1.34.8 nor Baileys 7.0.0-rc14 implements it, and OpenWA passes the
 QR string and the pairing-code request straight through to those libraries. There is no OpenWA-side
 fix, and nothing on the client side changes the outcome: switching engine, using a pairing code instead
 of a QR, or presenting a different client identity (`BAILEYS_BROWSER_NAME` or otherwise) all end at the
@@ -868,8 +868,11 @@ rm -rf node_modules/whatsapp-web.js && npm ci
 - On Baileys, the log repeats `Baileys connection dropped; reconnecting` with `statusCode=500` and
   `reason=Stream Errored (ack)` about every 50 minutes, and the account may stop receiving until the
   session is restarted (the status-ack patch is missing)
+- On Baileys, contact statuses never reach the status list of an account that receives them as
+  `<status>` stanzas (the status-ack patch is missing, or is the 0.30.1 revision, which only
+  acknowledged them)
 
-**Cause:** OpenWA applies fifteen exact source transforms to its engine libraries at install time
+**Cause:** OpenWA applies fourteen exact source transforms to its engine libraries at install time
 (docs/29 §29.3). The Docker image runs them without `--best-effort`, so a source shape a patcher
 cannot recognise fails the image build. Source installs run the Puppeteer compatibility transform
 without best-effort too, because browser teardown depends on it. The other transforms use
@@ -901,9 +904,9 @@ was cut short: an interrupted install left it half applied, and reinstalling `@w
 > `patch-baileys-media-stream.js`, a Baileys media download abandoned at `MEDIA_DOWNLOAD_TIMEOUT_MS` or
 > the byte cap can end the process with `TypeError: terminated`, and without
 > `patch-baileys-status-ack.js`, an account that WhatsApp sends contact statuses to as `<status>`
-> stanzas drops its connection about every 50 minutes. Every other patch affects only the
-> capability it repairs and the rest of the gateway runs normally, which is why this is easy to misread
-> as a bug in one route.
+> stanzas drops its connection about every 50 minutes and stores none of them. Every other patch
+> affects only the capability it repairs and the rest of the gateway runs normally, which is why this
+> is easy to misread as a bug in one route.
 
 ### Issue: Reads on a large account fail with `did not answer ... in time` or `Runtime.callFunctionOn timed out`
 
@@ -1629,7 +1632,7 @@ available_events:
   - session.restriction # WhatsApp restricted the account, or lifted it (payload: sessionId, active, kind, code, expiresAt)
   - presence.update # A subscribed chat's presence changed (Baileys only; the subscribe route answers 501 on whatsapp-web.js; payload: sessionId, chatId, participants, groupOnlineCount)
   - event.response # A guest answered a WhatsApp event invitation (Baileys only; payload: sessionId, eventMessageId, chatId, responderId, response, responseMessageId, timestamp)
-  - poll.vote # A voter selected or cleared options on a poll (whatsapp-web.js only; payload: sessionId, pollMessageId, chatId, voterId, selectedOptions, pollName, timestamp, timestampMs)
+  - poll.vote # A voter selected or cleared options on a poll (Baileys requires the poll creation message in the session store; payload: sessionId, pollMessageId, chatId, voterId, selectedOptions, pollName, timestamp, timestampMs)
   - call.accepted # A ringing call was answered (Baileys only; payload: sessionId, callId, from, outcome, isVideo, isGroup, timestamp)
   - call.rejected # A ringing call was declined (Baileys only)
   - call.missed # A ringing call was never picked up (Baileys only)
