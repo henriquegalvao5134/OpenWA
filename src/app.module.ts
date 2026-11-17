@@ -47,6 +47,10 @@ import { AgentToolsModule } from './core/agent-tools/agent-tools.module';
 import { IntegrationModule } from './modules/integration/integration.module';
 import { SearchModule } from './modules/search/search.module';
 import { SqlitePermissionsBoot } from './database/sqlite-file-permissions';
+import { ScheduleModule } from '@nestjs/schedule';
+import { ComercialModule } from './modules/comercial/comercial.module';
+import { AnaliseModule } from './modules/analise/analise.module';
+import { ConversaoModule } from './modules/conversao/conversao.module';
 
 // Only import QueueModule if explicitly enabled to avoid Redis connection errors
 const queueModules: Array<Type | DynamicModule> = [];
@@ -312,6 +316,10 @@ if (dashboardServingEnabled && dashboardBuildPresent) {
     ...searchModules, // Global message search (opt-out via SEARCH_ENABLED=false; default ON)
     ...mcpModules, // MCP Streamable-HTTP server (opt-in via MCP_ENABLED=true)
     ...serveStaticModules, // Bundled dashboard SPA (production single-port setup)
+    ScheduleModule.forRoot(), // Cron jobs (análise IA a cada 15 min)
+    ComercialModule, // Multi-cliente: auth JWT, CRUD de clientes, contatos
+    AnaliseModule, // Análise de conversas com IA (Claude) + scheduler
+    ConversaoModule, // Revisão de conversões + envio Meta CAPI + Google Ads
   ],
   // Runs after every DataSource has initialized (they initialize eagerly in their provider
   // factories, and onApplicationBootstrap fires after every onModuleInit), tightening the SQLite

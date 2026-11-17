@@ -15,6 +15,11 @@ import './App.css';
 
 const Login = lazy(() => import('./pages/Login').then(m => ({ default: m.Login })));
 const Dashboard = lazy(() => import('./pages/Dashboard').then(m => ({ default: m.Dashboard })));
+const NegocioLogin = lazy(() => import('./pages/NegocioLogin').then(m => ({ default: m.NegocioLogin })));
+const Clientes = lazy(() => import('./pages/Clientes').then(m => ({ default: m.Clientes })));
+const Conversoes = lazy(() => import('./pages/Conversoes').then(m => ({ default: m.Conversoes })));
+const ConversasNegocio = lazy(() => import('./pages/ConversasNegocio').then(m => ({ default: m.ConversasNegocio })));
+const SaudeNegocio = lazy(() => import('./pages/SaudeNegocio').then(m => ({ default: m.SaudeNegocio })));
 const Sessions = lazy(() => import('./pages/Sessions').then(m => ({ default: m.Sessions })));
 const Chats = lazy(() => import('./pages/Chats').then(m => ({ default: m.Chats })));
 const Webhooks = lazy(() => import('./pages/Webhooks').then(m => ({ default: m.Webhooks })));
@@ -106,6 +111,26 @@ function AppContent() {
       <Loader2 className="animate-spin" size={32} />
     </div>
   );
+
+  // Rotas /negocio/* são completamente independentes do auth por API key
+  const isNegocioRoute = window.location.pathname.startsWith('/negocio');
+
+  if (isNegocioRoute) {
+    return (
+      <BrowserRouter>
+        <Suspense fallback={loadingFallback}>
+          <Routes>
+            <Route path="/negocio/login" element={<NegocioLogin />} />
+            <Route path="/negocio" element={<Clientes />} />
+            <Route path="/negocio/:slug/conversoes" element={<Conversoes />} />
+            <Route path="/negocio/:slug/conversas" element={<ConversasNegocio />} />
+            <Route path="/negocio/saude" element={<SaudeNegocio />} />
+            <Route path="/negocio/*" element={<Navigate to="/negocio" replace />} />
+          </Routes>
+        </Suspense>
+      </BrowserRouter>
+    );
+  }
 
   if (!isAuthenticated) {
     return (
