@@ -2,6 +2,7 @@ import { Controller, Post, Body, HttpCode } from '@nestjs/common';
 import { ApiOperation, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { IsEmail, IsString, MinLength } from 'class-validator';
 import { AuthNegocioService } from './auth-negocio.service';
+import { Public } from '../auth/decorators/auth.decorators';
 
 class LoginDto {
   @IsEmail()
@@ -13,7 +14,8 @@ class LoginDto {
 }
 
 @ApiTags('negocio-auth')
-@Controller('api/negocio/auth')
+@Public()
+@Controller('negocio/auth')
 export class AuthNegocioController {
   constructor(private readonly authService: AuthNegocioService) {}
 

@@ -5,6 +5,7 @@ import { ComercialService } from './comercial.service';
 import { JwtNegocioGuard } from './guards/jwt-negocio.guard';
 import { NegocioUser } from './decorators/negocio-user.decorator';
 import type { JwtNegocioPayload } from './auth-negocio.service';
+import { Public } from '../auth/decorators/auth.decorators';
 
 class CriarClienteDto {
   @IsString()
@@ -60,8 +61,9 @@ class AtualizarClienteDto {
 
 @ApiTags('negocio-clientes')
 @ApiBearerAuth()
+@Public()
 @UseGuards(JwtNegocioGuard)
-@Controller('api/negocio/clientes')
+@Controller('negocio/clientes')
 export class ComercialController {
   constructor(private readonly service: ComercialService) {}
 

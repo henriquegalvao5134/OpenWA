@@ -7,6 +7,7 @@ import { AnaliseService } from '../analise/analise.service';
 import { JwtNegocioGuard } from '../comercial/guards/jwt-negocio.guard';
 import { NegocioUser } from '../comercial/decorators/negocio-user.decorator';
 import type { JwtNegocioPayload } from '../comercial/auth-negocio.service';
+import { Public } from '../auth/decorators/auth.decorators';
 
 class RevisarDto {
   @IsString()
@@ -37,8 +38,9 @@ class ReanalisarDto {
 
 @ApiTags('negocio-conversoes')
 @ApiBearerAuth()
+@Public()
 @UseGuards(JwtNegocioGuard)
-@Controller('api/negocio/:slug/conversoes')
+@Controller('negocio/:slug/conversoes')
 export class ConversaoController {
   constructor(
     private readonly conversaoService: ConversaoService,

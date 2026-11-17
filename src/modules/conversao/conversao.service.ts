@@ -13,13 +13,13 @@ export type AcaoRevisao = 'confirmar' | 'corrigir' | 'rejeitar' | 'marcar_venda'
 @Injectable()
 export class ConversaoService {
   constructor(
-    @InjectRepository(VendaNegocio)
+    @InjectRepository(VendaNegocio, 'data')
     private readonly vendaRepo: Repository<VendaNegocio>,
-    @InjectRepository(AnaliseIa)
+    @InjectRepository(AnaliseIa, 'data')
     private readonly analiseRepo: Repository<AnaliseIa>,
-    @InjectRepository(ContatoNegocio)
+    @InjectRepository(ContatoNegocio, 'data')
     private readonly contatoRepo: Repository<ContatoNegocio>,
-    @InjectRepository(ClienteNegocio)
+    @InjectRepository(ClienteNegocio, 'data')
     private readonly clienteRepo: Repository<ClienteNegocio>,
     private readonly metaCapi: MetaCapiService,
     private readonly googleAds: GoogleAdsService,

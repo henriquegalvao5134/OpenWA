@@ -12,7 +12,7 @@ export class AnaliseScheduler {
 
   constructor(
     private readonly analiseService: AnaliseService,
-    @InjectRepository(ClienteNegocio)
+    @InjectRepository(ClienteNegocio, 'data')
     private readonly clienteRepo: Repository<ClienteNegocio>,
   ) {}
 

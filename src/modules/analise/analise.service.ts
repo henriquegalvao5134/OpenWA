@@ -69,13 +69,13 @@ export class AnaliseService {
   private readonly logger = new Logger(AnaliseService.name);
 
   constructor(
-    @InjectRepository(AnaliseIa)
+    @InjectRepository(AnaliseIa, 'data')
     private readonly analiseRepo: Repository<AnaliseIa>,
-    @InjectRepository(ContatoNegocio)
+    @InjectRepository(ContatoNegocio, 'data')
     private readonly contatoRepo: Repository<ContatoNegocio>,
-    @InjectRepository(ClienteNegocio)
+    @InjectRepository(ClienteNegocio, 'data')
     private readonly clienteRepo: Repository<ClienteNegocio>,
-    @InjectRepository(Message)
+    @InjectRepository(Message, 'data')
     private readonly messageRepo: Repository<Message>,
   ) {}
 

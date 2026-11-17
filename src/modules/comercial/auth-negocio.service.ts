@@ -16,7 +16,7 @@ export interface JwtNegocioPayload {
 @Injectable()
 export class AuthNegocioService {
   constructor(
-    @InjectRepository(UsuarioNegocio)
+    @InjectRepository(UsuarioNegocio, 'data')
     private readonly usuarioRepo: Repository<UsuarioNegocio>,
   ) {}
 

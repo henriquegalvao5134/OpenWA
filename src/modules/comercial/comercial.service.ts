@@ -8,9 +8,9 @@ import type { JwtNegocioPayload } from './auth-negocio.service';
 @Injectable()
 export class ComercialService {
   constructor(
-    @InjectRepository(ClienteNegocio)
+    @InjectRepository(ClienteNegocio, 'data')
     private readonly clienteRepo: Repository<ClienteNegocio>,
-    @InjectRepository(UsuarioCliente)
+    @InjectRepository(UsuarioCliente, 'data')
     private readonly ucRepo: Repository<UsuarioCliente>,
   ) {}
 
