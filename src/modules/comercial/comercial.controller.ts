@@ -1,6 +1,6 @@
 import { Controller, Get, Post, Patch, Param, Body, UseGuards } from '@nestjs/common';
 import { ApiOperation, ApiResponse, ApiTags, ApiBearerAuth } from '@nestjs/swagger';
-import { IsString, IsOptional, MaxLength } from 'class-validator';
+import { IsString, IsOptional, IsBoolean, MaxLength } from 'class-validator';
 import { ComercialService } from './comercial.service';
 import { JwtNegocioGuard } from './guards/jwt-negocio.guard';
 import { NegocioUser } from './decorators/negocio-user.decorator';
@@ -57,6 +57,23 @@ class AtualizarClienteDto {
   @IsOptional()
   @MaxLength(60)
   modeloIa?: string;
+
+  @IsString()
+  @IsOptional()
+  observacoes?: string;
+
+  @IsString()
+  @IsOptional()
+  @MaxLength(100)
+  googleConversionId?: string;
+
+  @IsBoolean()
+  @IsOptional()
+  metaLdu?: boolean;
+
+  @IsBoolean()
+  @IsOptional()
+  ativo?: boolean;
 }
 
 @ApiTags('negocio-clientes')

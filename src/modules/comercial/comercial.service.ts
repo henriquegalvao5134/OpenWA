@@ -60,6 +60,11 @@ export class ComercialService {
     // Nunca sobrescrever token via PATCH sem campo dedicado
     delete (dados as Partial<ClienteNegocio>).metaAccessTokenEncrypted;
     Object.assign(cliente, dados);
-    return this.clienteRepo.save(cliente);
+    await this.clienteRepo.save(cliente);
+
+    // Recarrega do banco e omite o token criptografado (igual ao buscarCliente)
+    const atualizado = await this.clienteRepo.findOne({ where: { id } });
+    const { metaAccessTokenEncrypted: _, ...rest } = atualizado!;
+    return rest as ClienteNegocio;
   }
 }
